@@ -212,6 +212,13 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 
 	fmt.Println("🔄 Streaming started...")
 
+	// Active only for Ollama when the user hasn't opted into raw chunks.
+	// nil = forward every chunk unchanged.
+	var ollamaFilter *streaming.OllamaStreamFilter
+	if providerName == "ollama" && h.cfg.OllamaFilterEmptyChunks {
+		ollamaFilter = streaming.NewOllamaStreamFilter()
+	}
+
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
@@ -257,19 +264,23 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 			return
 		}
 
-		// Send chunk to client
-		if err := streaming.SendSSEData(c, chunk); err != nil {
-			// Client disconnected
-			fmt.Printf("⚠️ Client disconnected: %v\n", err)
-			return
+		// Send chunk to client only if the filter (when active) allows it.
+		// Internal bookkeeping below runs for every chunk regardless, so we
+		// never lose finish_reason / usage / content data even when the
+		// client stream is being de-noised.
+		if ollamaFilter.Forward(chunk) {
+			if err := streaming.SendSSEData(c, chunk); err != nil {
+				// Client disconnected
+				fmt.Printf("⚠️ Client disconnected: %v\n", err)
+				return
+			}
 		}
 
-		// Collect chunk for post-processing
+		// Collect chunk for post-processing (caching, cost, logs)
 		if len(chunk.Choices) > 0 {
 			delta := chunk.Choices[0].Delta
 			collector.AddChunk(delta.Content)
 
-			// Capture finish reason
 			if chunk.Choices[0].FinishReason != "" {
 				collector.SetFinishReason(string(chunk.Choices[0].FinishReason))
 			}

@@ -58,6 +58,10 @@ type Config struct {
 	OllamaModelBalanced string // e.g. qwen2.5:14b
 	OllamaModelBudget   string // e.g. gemma3:4b
 
+	// Drop Ollama SSE chunks with empty content/tool_calls (role-only noise).
+	// Set OLLAMA_FILTER_EMPTY_CHUNKS=false for raw byte-for-byte streams.
+	OllamaFilterEmptyChunks bool
+
 	// Cache
 	CacheTTLSeconds int
 	HotKeyCacheTTL  int // Longer TTL for frequently used keys
@@ -126,6 +130,7 @@ func Load() *Config {
 		OllamaModelFlagship: getEnv("OLLAMA_MODEL_FLAGSHIP", "llama3.3:70b"),
 		OllamaModelBalanced: getEnv("OLLAMA_MODEL_BALANCED", "qwen2.5:14b"),
 		OllamaModelBudget:   getEnv("OLLAMA_MODEL_BUDGET", "gemma3:4b"),
+		OllamaFilterEmptyChunks: getEnvAsBool("OLLAMA_FILTER_EMPTY_CHUNKS", true),
 
 		// Cache
 		CacheTTLSeconds: getEnvAsInt("CACHE_TTL_SECONDS", 3600),  // 1 hour default

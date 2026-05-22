@@ -113,27 +113,19 @@ full methodology, query, and Linux-vs-macOS comparison.
 
 ## [Unreleased]
 
-### Planned
+### Fixed
 
 - **Filter empty-delta chunks from Ollama streams.** Ollama's
-  OpenAI-compatible adapter emits a long run of
-  `{"delta":{"role":"assistant"}}` chunks with no `content` field at the
-  start of every stream (observed ~150 chunks on `gemma3:e2b`). These
-  are valid SSE but wasteful — they consume bandwidth, inflate log
-  volume, and add visible lag in any UI that shows "thinking" indicators
-  per chunk. Drop chunks where both `delta.content` and `delta.tool_calls`
-  are empty, unless the chunk carries `finish_reason` or the first
-  `role` assignment. Cloud providers don't exhibit this pattern so the
-  filter only activates on the Ollama path.
-  - Location: `internal/gateway/handlers/chat_stream.go`, inside the
-    provider stream loop after `stream.Recv()` and before `SendSSEChunk`.
-  - Acceptance: `curl -N ... "stream": true` against a gemma/llama
-    Ollama model should produce chunks that all carry visible `content`,
-    with the first `role` chunk and the terminal `finish_reason` chunk
-    preserved.
-  - Keep it behind a flag (`OLLAMA_FILTER_EMPTY_CHUNKS=true` default) so
-    users who actually want the raw Ollama byte-for-byte stream can opt
-    out.
+  OpenAI-compatible adapter can emit many `{"delta":{"role":"assistant"}}`
+  frames before the first content token. The gateway now drops chunks
+  with empty `content` and `tool_calls`, while preserving the first
+  `role` chunk and any chunk with `finish_reason`. Enabled by default;
+  set `OLLAMA_FILTER_EMPTY_CHUNKS=false` for the raw upstream stream.
+  Implementation: `internal/gateway/streaming/ollama_filter.go`, wired
+  in `internal/gateway/handlers/chat_stream.go`.
+
+### Planned
+
 - **Round `cost_usd` to 6 decimals at source.** Today the header path
   formats `X-Cost-Usd` with `%.6f` (e.g. `0.000007`) but the response
   body and streaming metadata frame write the raw `float64`, so users

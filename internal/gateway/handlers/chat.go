@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -141,6 +142,26 @@ func (h *ChatHandler) detectProvider(model string) (string, LLMProvider) {
 	return "", nil
 }
 
+// validateChatRequest rejects bodies that parse as JSON but omit required
+// fields. Common culprit: copy-pasted curl bodies with curly/smart quotes
+// (U+201C / U+201D) where the "model" and "messages" keys never bind and
+// arrive empty — surfacing as a confusing 400 from the upstream provider
+// rather than a clear 400 from the gateway.
+func validateChatRequest(req providers.ChatRequest) string {
+	if strings.TrimSpace(req.Model) == "" {
+		return "model is required (check for curly/smart quotes in JSON — use straight \" characters)"
+	}
+	if len(req.Messages) == 0 {
+		return "messages must contain at least one entry (empty messages often means invalid JSON keys from curly/smart quotes in the body)"
+	}
+	for i, msg := range req.Messages {
+		if strings.TrimSpace(msg.Role) == "" {
+			return fmt.Sprintf("messages[%d].role is required", i)
+		}
+	}
+	return ""
+}
+
 // ChatCompletions handles POST /v1/chat/completions
 func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 	startTime := time.Now()
@@ -156,6 +177,10 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 	var req providers.ChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "invalid_request", "message": err.Error()})
+		return
+	}
+	if msg := validateChatRequest(req); msg != "" {
+		c.JSON(400, gin.H{"error": "invalid_request", "message": msg})
 		return
 	}
 

@@ -178,6 +178,7 @@ data: [DONE]
 ```
 
 **Streaming behavior notes:**
+- **Ollama empty-chunk filtering (default on).** Ollama's OpenAI adapter often sends many role-only SSE frames before content; the gateway drops those duplicates and keeps the first `role` chunk plus all content/`finish_reason` frames. Set `OLLAMA_FILTER_EMPTY_CHUNKS=false` to pass the raw stream through.
 - **Cache hits return a single JSON body, not a stream.** The response is already complete — there's nothing to stream — so you get the cached payload with `X-Cache-Hit: exact` or `semantic` set. Treat `Content-Type: application/json` in response to a stream request as "this was a cache hit." This matches OpenAI's own caching semantics.
 - **Failover is disabled for streaming requests.** Once a single chunk has been written to the client, we can't retry against a different provider without breaking the stream. Non-streaming requests keep full automatic failover. If provider reliability matters more than streaming UX, set `"stream": false`.
 - **No client-side timeout issues.** The gateway disables the server's 60-second `WriteTimeout` on streaming requests only, so long reasoning outputs (o1, Claude extended thinking) and slow local Ollama generations aren't truncated.
@@ -557,6 +558,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env`.
 | `OLLAMA_MODEL_FLAGSHIP` | `llama3.3:70b` | Local model used as substitute for flagship-tier cloud models (gpt-4o, claude-opus, gemini-pro) |
 | `OLLAMA_MODEL_BALANCED` | `qwen2.5:14b` | Local model used as substitute for balanced-tier cloud models (gpt-4o-mini, claude-sonnet, gemini-flash) |
 | `OLLAMA_MODEL_BUDGET` | `gemma3:4b` | Local model used as substitute for budget-tier cloud models (gpt-3.5, claude-haiku, gemini-flash-lite) |
+| `OLLAMA_FILTER_EMPTY_CHUNKS` | `true` | Drop empty role-only SSE chunks from Ollama streams before forwarding to clients. Set `false` for raw upstream chunks |
 
 ### Failover
 
