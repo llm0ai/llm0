@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -429,6 +430,7 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 		fmt.Printf("⚠️ Cost calculation failed: %v\n", err)
 		actualCost = estimatedCost // Use estimate as fallback
 	}
+	actualCost = math.Round(actualCost*1e6) / 1e6
 
 	// Step 6: Track actual spend (adjust for estimate)
 	spendAdjustment := actualCost - estimatedCost

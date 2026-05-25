@@ -340,6 +340,129 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hello!"}]}'
 ```
 
+### Call from Python or Node
+
+The gateway is **OpenAI-compatible** — point the official SDK at `http://localhost:8080/v1` and use your `llm0_live_...` key. Swap `model` for any routed name (`claude-haiku-4-5-20251001`, `gemini-2.0-flash`, `gemma3:4b`, …).
+
+**Python — single request**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="llm0_live_...",  # from ./scripts/create_api_key.sh
+)
+
+resp = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "What is the capital of France?"}],
+)
+
+print(resp.choices[0].message.content)
+# Gateway extras on the JSON body (latency_ms, cost_usd):
+print(resp.model_extra.get("cost_usd"), resp.model_extra.get("latency_ms"))
+```
+
+**Python — simple agent loop (per-user spend caps)**
+
+Pass `X-Customer-ID` so the gateway can enforce daily/monthly limits per end-user. Optional `X-LLM0-*` headers tag requests for analytics (team, agent name, tier).
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="llm0_live_...",
+    default_headers={
+        "X-Customer-ID": "user_123",
+        "X-LLM0-Agent": "support-bot",
+        "X-LLM0-Team": "ops",
+    },
+)
+
+messages = [{"role": "system", "content": "You are a helpful assistant."}]
+
+while True:
+    user = input("You: ").strip()
+    if not user:
+        break
+    messages.append({"role": "user", "content": user})
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+    )
+    reply = resp.choices[0].message.content
+    messages.append({"role": "assistant", "content": reply})
+
+    cost = resp.model_extra.get("cost_usd", 0)
+    print(f"Assistant (${cost:.6f}): {reply}\n")
+```
+
+Install: `pip install openai`
+
+**Node — single request**
+
+```javascript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://localhost:8080/v1",
+  apiKey: process.env.LLM0_API_KEY, // llm0_live_...
+});
+
+const resp = await client.chat.completions.create({
+  model: "gpt-4o-mini",
+  messages: [{ role: "user", content: "What is the capital of France?" }],
+});
+
+console.log(resp.choices[0].message.content);
+// Gateway adds cost_usd / latency_ms to the JSON body (may appear as extra fields):
+console.log((resp).cost_usd, (resp).latency_ms);
+```
+
+**Node — agent with per-user headers**
+
+```javascript
+import OpenAI from "openai";
+import * as readline from "node:readline/promises";
+
+const client = new OpenAI({
+  baseURL: "http://localhost:8080/v1",
+  apiKey: process.env.LLM0_API_KEY,
+  defaultHeaders: {
+    "X-Customer-ID": "user_123",
+    "X-LLM0-Agent": "support-bot",
+  },
+});
+
+const messages = [{ role: "system", content: "You are a helpful assistant." }];
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+while (true) {
+  const user = (await rl.question("You: ")).trim();
+  if (!user) break;
+
+  messages.push({ role: "user", content: user });
+  const resp = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages,
+  });
+
+  const reply = resp.choices[0].message.content ?? "";
+  messages.push({ role: "assistant", content: reply });
+  const cost = Number((resp).cost_usd ?? 0);
+  console.log(`Assistant ($${cost.toFixed(6)}): ${reply}\n`);
+}
+
+rl.close();
+```
+
+Install: `npm install openai`
+
+> **LangChain / Vercel AI SDK / etc.** — same pattern: set `baseURL` / `base_url` to `http://localhost:8080/v1` and use the `llm0_live_...` key. Tool-calling agents work unchanged; the gateway normalizes provider responses to OpenAI's schema.
+
 **Useful Docker commands**
 
 ```bash

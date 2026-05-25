@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"time"
 
@@ -229,13 +230,14 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 			collector.EstimateTokensIfNeeded()
 			fullResponse := collector.ToResponse()
 
-			actualCost, err := h.costCalculator.CalculateCost(providerName, req.Model, fullResponse.Usage.PromptTokens, fullResponse.Usage.CompletionTokens)
-			if err != nil {
-				fmt.Printf("⚠️ Cost calculation failed: %v\n", err)
-				actualCost = estimatedCost
-			}
+		actualCost, err := h.costCalculator.CalculateCost(providerName, req.Model, fullResponse.Usage.PromptTokens, fullResponse.Usage.CompletionTokens)
+		if err != nil {
+			fmt.Printf("⚠️ Cost calculation failed: %v\n", err)
+			actualCost = estimatedCost
+		}
+		actualCost = math.Round(actualCost*1e6) / 1e6
 
-			// Send cost metadata before [DONE]
+		// Send cost metadata before [DONE]
 			costData := map[string]interface{}{
 				"object": "chat.completion.chunk.metadata",
 				"usage": map[string]interface{}{
@@ -328,6 +330,7 @@ func (h *ChatHandler) postStreamProcessing(
 		fmt.Printf("⚠️ Cost calculation failed: %v\n", err)
 		actualCost = estimatedCost
 	}
+	actualCost = math.Round(actualCost*1e6) / 1e6
 
 	fullResponse.CostUSD = actualCost
 
