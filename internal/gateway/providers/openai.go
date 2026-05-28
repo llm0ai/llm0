@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/config"
+	"github.com/llm0ai/llm0/internal/shared/config"
 	"github.com/sashabaranov/go-openai"
 )
 

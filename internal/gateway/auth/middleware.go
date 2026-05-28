@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/models"
+	"github.com/llm0ai/llm0/internal/shared/models"
 )
 
 // Middleware handles API key authentication for Gateway requests

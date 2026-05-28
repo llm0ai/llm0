@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/models"
+	"github.com/llm0ai/llm0/internal/shared/models"
 )
 
 func TestCustomerLimitCache_MissOnEmpty(t *testing.T) {

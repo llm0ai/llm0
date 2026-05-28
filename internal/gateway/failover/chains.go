@@ -3,7 +3,7 @@ package failover
 import (
 	"strings"
 
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/config"
+	"github.com/llm0ai/llm0/internal/shared/config"
 )
 
 // Preset failover chains for Pro tier users

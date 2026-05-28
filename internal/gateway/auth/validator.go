@@ -10,10 +10,10 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/config"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/database"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/models"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/redis"
+	"github.com/llm0ai/llm0/internal/shared/config"
+	"github.com/llm0ai/llm0/internal/shared/database"
+	"github.com/llm0ai/llm0/internal/shared/models"
+	"github.com/llm0ai/llm0/internal/shared/redis"
 )
 
 // Validator handles API key validation with Redis caching

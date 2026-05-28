@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/config"
+	"github.com/llm0ai/llm0/internal/shared/config"
 )
 
 // Client wraps Redis client with optimizations from rate_limiter_go

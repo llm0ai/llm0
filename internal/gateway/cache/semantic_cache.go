@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/embeddings"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/providers"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/database"
+	"github.com/llm0ai/llm0/internal/gateway/embeddings"
+	"github.com/llm0ai/llm0/internal/gateway/providers"
+	"github.com/llm0ai/llm0/internal/shared/database"
 	"github.com/pgvector/pgvector-go"
 )
 

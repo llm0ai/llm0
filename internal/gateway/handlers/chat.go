@@ -12,17 +12,17 @@ import (
 	"github.com/google/uuid"
 	"github.com/sashabaranov/go-openai"
 
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/auth"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/cache"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/cost"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/embeddings"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/failover"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/providers"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/ratelimit"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/config"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/database"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/models"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/redis"
+	"github.com/llm0ai/llm0/internal/gateway/auth"
+	"github.com/llm0ai/llm0/internal/gateway/cache"
+	"github.com/llm0ai/llm0/internal/gateway/cost"
+	"github.com/llm0ai/llm0/internal/gateway/embeddings"
+	"github.com/llm0ai/llm0/internal/gateway/failover"
+	"github.com/llm0ai/llm0/internal/gateway/providers"
+	"github.com/llm0ai/llm0/internal/gateway/ratelimit"
+	"github.com/llm0ai/llm0/internal/shared/config"
+	"github.com/llm0ai/llm0/internal/shared/database"
+	"github.com/llm0ai/llm0/internal/shared/models"
+	"github.com/llm0ai/llm0/internal/shared/redis"
 )
 
 // ChatHandler handles chat completion requests

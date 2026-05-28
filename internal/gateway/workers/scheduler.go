@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/database"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/redis"
+	"github.com/llm0ai/llm0/internal/shared/database"
+	"github.com/llm0ai/llm0/internal/shared/redis"
 )
 
 // Scheduler manages all scheduled background jobs

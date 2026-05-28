@@ -1,4 +1,4 @@
-module github.com/mrmushfiq/llm0-gateway
+module github.com/llm0ai/llm0
 
 go 1.25.0
 

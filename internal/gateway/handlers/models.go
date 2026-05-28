@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/failover"
+	"github.com/llm0ai/llm0/internal/gateway/failover"
 )
 
 // modelObject mirrors the OpenAI /v1/models response shape.
