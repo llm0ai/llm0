@@ -9,8 +9,14 @@
 !.env.example
 
 # ── Go build artifacts ────────────────────────────────────────────────────────
-# Only the compiled binary at the repo root (not the source directories)
+# Root-level binaries only. The ! rules ensure a future llm0/ or gateway/
+# source directory at repo root would still be trackable.
+/llm0
+!/llm0/
+!/llm0/**
 /gateway
+!/gateway/
+!/gateway/**
 *.exe
 
 # ── Python (embedding_service/) ──────────────────────────────────────────────

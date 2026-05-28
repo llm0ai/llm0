@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/database"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/models"
-	redisClient "github.com/mrmushfiq/llm0-gateway/internal/shared/redis"
+	"github.com/llm0ai/llm0/internal/shared/database"
+	"github.com/llm0ai/llm0/internal/shared/models"
+	redisClient "github.com/llm0ai/llm0/internal/shared/redis"
 )
 
 // ============================================================================

@@ -3,7 +3,7 @@ package failover
 import (
 	"testing"
 
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/config"
+	"github.com/llm0ai/llm0/internal/shared/config"
 )
 
 // cfgWithOllama returns a config with Ollama enabled and model tier mappings set.

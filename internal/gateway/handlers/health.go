@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/database"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/redis"
+	"github.com/llm0ai/llm0/internal/shared/database"
+	"github.com/llm0ai/llm0/internal/shared/redis"
 )
 
 // HealthHandler handles health check requests
@@ -31,7 +31,7 @@ func (h *HealthHandler) HealthCheck(c *gin.Context) {
 	status := gin.H{
 		"status":    "healthy",
 		"timestamp": time.Now().Unix(),
-		"service":   "llm0-gateway-api",
+		"service":   "llm0",
 	}
 
 	// Check database

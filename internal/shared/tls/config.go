@@ -4,7 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/config"
+	"github.com/llm0ai/llm0/internal/shared/config"
 )
 
 // CreateOptimizedTLSConfig creates a TLS 1.3 configuration optimized for performance

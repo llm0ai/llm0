@@ -13,13 +13,13 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/auth"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/handlers"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/workers"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/config"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/database"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/redis"
-	tlsConfig "github.com/mrmushfiq/llm0-gateway/internal/shared/tls"
+	"github.com/llm0ai/llm0/internal/gateway/auth"
+	"github.com/llm0ai/llm0/internal/gateway/handlers"
+	"github.com/llm0ai/llm0/internal/gateway/workers"
+	"github.com/llm0ai/llm0/internal/shared/config"
+	"github.com/llm0ai/llm0/internal/shared/database"
+	"github.com/llm0ai/llm0/internal/shared/redis"
+	tlsConfig "github.com/llm0ai/llm0/internal/shared/tls"
 )
 
 func main() {

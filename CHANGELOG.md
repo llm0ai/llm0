@@ -219,6 +219,6 @@ embedding image are unchanged.
 
 ---
 
-[Unreleased]: https://github.com/mrmushfiq/llm0-gateway/compare/v0.1.2...HEAD
-[0.1.2]: https://github.com/mrmushfiq/llm0-gateway/compare/v0.1.1...v0.1.2
-[0.1.1]: https://github.com/mrmushfiq/llm0-gateway/releases/tag/v0.1.1
+[Unreleased]: https://github.com/llm0ai/llm0/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/llm0ai/llm0/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/llm0ai/llm0/releases/tag/v0.1.1

@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/providers"
+	"github.com/llm0ai/llm0/internal/gateway/providers"
 )
 
 // Provider interface that all LLM providers must implement

@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/database"
+	"github.com/llm0ai/llm0/internal/shared/database"
 )
 
 // Logger logs failover events to the database

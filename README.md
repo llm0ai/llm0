@@ -275,8 +275,8 @@ Requires: [Docker Desktop](https://www.docker.com/products/docker-desktop/).
 **Step 1 — Clone and configure**
 
 ```bash
-git clone https://github.com/mrmushfiq/llm0-gateway
-cd llm0-gateway
+git clone https://github.com/llm0ai/llm0
+cd llm0
 
 cp .env.example .env
 ```
@@ -524,8 +524,8 @@ Requires: Go 1.24+, Postgres with the `pgvector` extension, Redis.
 **Step 1 — Clone and configure**
 
 ```bash
-git clone https://github.com/mrmushfiq/llm0-gateway
-cd llm0-gateway
+git clone https://github.com/llm0ai/llm0
+cd llm0
 
 cp .env.example .env
 # Edit .env — set DATABASE_URL, REDIS_URL, and at least one provider key
@@ -556,8 +556,8 @@ go run ./cmd/gateway/main.go
 Or build a binary:
 
 ```bash
-go build -o llm0-gateway ./cmd/gateway/main.go
-./llm0-gateway
+go build -o llm0 ./cmd/gateway/main.go
+./llm0
 ```
 
 ---

@@ -12,10 +12,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/sashabaranov/go-openai"
 
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/auth"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/providers"
-	"github.com/mrmushfiq/llm0-gateway/internal/gateway/streaming"
-	"github.com/mrmushfiq/llm0-gateway/internal/shared/models"
+	"github.com/llm0ai/llm0/internal/gateway/auth"
+	"github.com/llm0ai/llm0/internal/gateway/providers"
+	"github.com/llm0ai/llm0/internal/gateway/streaming"
+	"github.com/llm0ai/llm0/internal/shared/models"
 )
 
 // ChatCompletionsStream handles streaming chat completion requests
