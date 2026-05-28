@@ -113,25 +113,14 @@ full methodology, query, and Linux-vs-macOS comparison.
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- **Filter empty-delta chunks from Ollama streams.** Ollama's
-  OpenAI-compatible adapter can emit many `{"delta":{"role":"assistant"}}`
-  frames before the first content token. The gateway now drops chunks
-  with empty `content` and `tool_calls`, while preserving the first
-  `role` chunk and any chunk with `finish_reason`. Enabled by default;
-  set `OLLAMA_FILTER_EMPTY_CHUNKS=false` for the raw upstream stream.
-  Implementation: `internal/gateway/streaming/ollama_filter.go`, wired
-  in `internal/gateway/handlers/chat_stream.go`.
+- **Renamed Go module and repository** from `github.com/mrmushfiq/llm0-gateway`
+  to `github.com/llm0ai/llm0`. Update clone URLs, import paths, and the
+  compiled binary name (`llm0`). Old Go module paths no longer resolve.
 
-- **Round `cost_usd` to 6 decimals at source.** The `X-Cost-Usd` header
-  was formatted with `%.6f` but the JSON body and SSE metadata frame
-  wrote the raw `float64`, producing `"cost_usd": 0.0000065999999999999995`
-  while the matching header showed `0.000007`. A single
-  `math.Round(actualCost*1e6) / 1e6` after each `CalculateCost` call
-  aligns all consumers: header, body, metadata frame, and
-  `gateway_logs.cost_usd`. Locations: `chat.go` (non-streaming path),
-  `chat_stream.go` EOF branch, `chat_stream.go` `postStreamProcessing`.
+### Planned
+
 - **Scheduler heartbeat table** to close the v0.1.1 paper cut where
   `SELECT count(*) FROM system_logs` returns zero on a fresh install
   even though the scheduler is healthy. See
@@ -161,6 +150,40 @@ These are loose ideas — promote to **Planned** when confirmed:
 - Switch Redis `maxmemory-policy` from `allkeys-lru` to `noeviction` (or
   a key-prefix-aware alternative) so `spend:*` counters can't be evicted
   under memory pressure.
+
+---
+
+## [0.1.3] — 2026-05-25
+
+Patch release: Ollama streaming cleanup, cost precision fix, and request
+validation. No schema changes, no env var changes beyond one new optional
+toggle.
+
+### Fixed
+
+- **Filter empty-delta chunks from Ollama streams.** Ollama's
+  OpenAI-compatible adapter can emit many `{"delta":{"role":"assistant"}}`
+  frames before the first content token. The gateway now drops chunks
+  with empty `content` and `tool_calls`, while preserving the first
+  `role` chunk and any chunk with `finish_reason`. Enabled by default;
+  set `OLLAMA_FILTER_EMPTY_CHUNKS=false` for the raw upstream stream.
+  Implementation: `internal/gateway/streaming/ollama_filter.go`, wired
+  in `internal/gateway/handlers/chat_stream.go`.
+
+- **Round `cost_usd` to 6 decimals at source.** The `X-Cost-Usd` header
+  was formatted with `%.6f` but the JSON body and SSE metadata frame
+  wrote the raw `float64`, producing `"cost_usd": 0.0000065999999999999995`
+  while the matching header showed `0.000007`. A single
+  `math.Round(actualCost*1e6) / 1e6` after each `CalculateCost` call
+  aligns all consumers: header, body, metadata frame, and
+  `gateway_logs.cost_usd`. Locations: `chat.go` (non-streaming path),
+  `chat_stream.go` EOF branch, `chat_stream.go` `postStreamProcessing`.
+
+### Added
+
+- **Request validation** on `/v1/chat/completions` — rejects malformed
+  payloads (missing `model`, empty `messages`, invalid roles) with
+  OpenAI-style 400 errors before hitting upstream providers.
 
 ---
 
@@ -219,6 +242,7 @@ embedding image are unchanged.
 
 ---
 
-[Unreleased]: https://github.com/llm0ai/llm0/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/llm0ai/llm0/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/llm0ai/llm0/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/llm0ai/llm0/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/llm0ai/llm0/releases/tag/v0.1.1
