@@ -1,11 +1,22 @@
-# LLM0 Gateway
+# LLM0 — Spend Firewall for LLM APIs
 
 [![Go](https://img.shields.io/badge/Go-1.24-blue?logo=go)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/Docker-Compose-blue?logo=docker)](docker-compose.yml)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI_Compatible-412991)](https://platform.openai.com/docs/api-reference)
 
-A production-grade, self-hosted LLM gateway written in Go. One **OpenAI-compatible** API endpoint for **OpenAI**, **Anthropic**, **Google Gemini**, and **local Ollama models** — with configurable cloud/local failover, two-tier caching, streaming, per-key rate limiting, per-customer spend caps, and cost tracking out of the box.
+> **Hard budget caps for OpenAI, Claude & Gemini — block runaway costs before they happen.**
+
+OpenAI's spending limits email you *after* the money's gone. Anthropic has no budget controls. Gemini has rate limits but not token budgets. So a single runaway loop — or one abusive user — can burn your whole monthly budget in minutes.
+
+**LLM0 is a drop-in spend firewall.** Point your OpenAI / Anthropic / Gemini calls at it (change one line — your `base_url`) and it enforces **hard budget caps per end-user and per project**, blocking requests **before** the API call when a cap would be exceeded. You also get **cost-per-customer tracking**, exact + semantic caching to cut spend, and automatic failover — in a single 30 MB Go binary.
+
+```bash
+# one line: route through the firewall instead of straight to OpenAI
+base_url = "http://localhost:8080/v1"   # instead of https://api.openai.com/v1
+```
+
+Self-hosted and MIT-licensed. **Don't want to run infra?** [llm0.ai](https://llm0.ai) is the managed version — hosted, with a cost-per-customer dashboard and spend alerts. Free tier, no credit card. *(waitlist / early access)*
 
 ```bash
 curl -i http://localhost:8080/v1/chat/completions \
@@ -73,14 +84,14 @@ Switch `gpt-4o-mini` for `claude-haiku-4-5-20251001`, `gemini-2.0-flash`, or any
 
 ---
 
-## Why LLM0 Gateway?
+## Why LLM0?
 
-- **One endpoint, four backends** — swap between OpenAI, Anthropic, Gemini, and local Ollama models without touching client code.
-- **Local-first or cloud-first, your choice** — a single `FAILOVER_MODE` env var decides whether requests try Ollama first, cloud first, local-only, or cloud-only. Great for privacy-sensitive workloads that need cloud as a backup.
-- **Never get paged for a provider outage** — automatic failover on `429`/`5xx`/`4xx`/timeout/connection errors across providers. Clients never see the failure.
-- **Save real money with two-tier caching** — exact-match cache returns in `<1ms`; an optional **semantic cache** (`pgvector` + `all-MiniLM-L6-v2` embeddings) catches paraphrased duplicates so "What's the capital of France?" and "Tell me France's capital city" share one cached answer. Local Ollama calls cost `$0`.
-- **Built-in SaaS controls** — per-API-key rate limits, per-customer spend caps, hard monthly project caps, customer labels for analytics.
-- **Zero lock-in** — single Go binary, standard Postgres + Redis, open source.
+- **Hard caps that actually stop spend** — OpenAI/Anthropic/Gemini only cap *after* you've overspent. LLM0 estimates each request's cost and **blocks it before the call** if it would breach a **per-user spend limit** or **per-project budget cap** (`402`/`429` with structured details). No more $X,XXX surprise overnight.
+- **Know your cost per customer** — tag every request with `X-Customer-ID` and see exactly which users (and which pricing tiers) cost you money, so you can price without losing margin.
+- **Stop one user from ruining your day** — per-end-user daily/monthly caps with `block` or auto-`downgrade` to a cheaper model. A leaked key or runaway agent loop can't drain your account.
+- **Cut spend automatically** — exact + semantic caching returns repeat/paraphrased answers at `$0`; local Ollama calls are always `$0`.
+- **One drop-in line, any language** — it's an OpenAI-compatible endpoint, so you change a `base_url`, not your SDK. Works the same for OpenAI, Anthropic, Gemini, and local Ollama, with automatic failover.
+- **Self-hosted, zero lock-in** — single 30 MB Go binary, your keys, your data, MIT-licensed.
 
 ---
 
