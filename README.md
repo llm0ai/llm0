@@ -1449,9 +1449,12 @@ Areas where contributions are especially useful:
 - Per-model-class routing rules (e.g. "always route coding tasks to X")
 
 See [`CHANGELOG.md`](./CHANGELOG.md) for the full release history. The
-current `[Unreleased]` block tracks the spend-firewall expansion: project
-default customer limits, owner-defined tiers (`X-Customer-Tier`), and
-μUSD-precision (`DECIMAL(14,6)`) USD storage end-to-end.
+upcoming **v0.3.0** release expands the spend firewall with project
+default customer limits, owner-defined tiers (`X-Customer-Tier`), real
+streaming-path enforcement, downgrade-on-cap, and μUSD-precision
+(`DECIMAL(14,6)`) USD storage end-to-end — see the
+[v0.3.0 upgrade notes](./CHANGELOG.md#upgrade-notes) for the schema
+migration command.
 
 ---
 

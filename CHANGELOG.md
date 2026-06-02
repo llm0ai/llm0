@@ -113,6 +113,56 @@ full methodology, query, and Linux-vs-macOS comparison.
 
 ## [Unreleased]
 
+### Planned
+
+- **Scheduler heartbeat table** to close the v0.1.1 paper cut where
+  `SELECT count(*) FROM system_logs` returns zero on a fresh install
+  even though the scheduler is healthy. See
+  [`design/background-workers.md`](../design/background-workers.md#candidate-fix-for-v012)
+  for the proposed `scheduler_heartbeat` design.
+- **`manage_limits.sh` auto-invalidates the API-key auth cache** after
+  UPDATEs to `projects` (cap, rate limit, cache flags). Today an
+  operator has to manually `DEL apikey:*` for changes to propagate
+  faster than `CACHE_TTL_SECONDS` (default 1 hour). See
+  [`design/enforcement-and-caching.md`](../design/enforcement-and-caching.md)
+  → "Propagation delay on config changes".
+
+### Candidates (not committed)
+
+These are loose ideas — promote to **Planned** when confirmed:
+
+- Prometheus `/metrics` endpoint (counters for provider/model/status,
+  latency histograms, cache hit rate, failover count, cost total).
+- Add `xai-*` (Grok) provider — prefix-based routing is already in
+  place.
+- Add `deepseek-*` provider via their OpenAI-compatible endpoint.
+- `/v1/embeddings` proxy so users can use the bundled embedding service
+  through the same auth/rate-limit/spend-cap plumbing.
+- Publish pre-built Docker images to GHCR.
+- Document streaming integration recipes (LangChain, LlamaIndex, Vercel
+  AI SDK) in `docs/integrations/`.
+- Switch Redis `maxmemory-policy` from `allkeys-lru` to `noeviction` (or
+  a key-prefix-aware alternative) so `spend:*` counters can't be evicted
+  under memory pressure.
+- Sub-token-cost USD precision (`DECIMAL(16,8)`) — only relevant for
+  micro-billing scenarios where a single token of `gpt-4o-mini` input
+  (~$0.00000015) needs to be represented exactly. μUSD (6 decimals) is
+  enough for every cap and request cost LLM gateways realistically see.
+
+---
+
+## [0.3.0] — 2026-06-XX
+
+**Spend-firewall expansion.** Per-customer enforcement now works without
+writing a row per end-user: every project carries default caps, owner-defined
+**tiers** (`X-Customer-Tier`) override the defaults, and streaming requests
+are finally subject to the same caps as non-streaming. All USD storage
+widened to **μUSD precision** (`DECIMAL(14,6)`) so sub-cent caps like
+`$0.001/day` are usable. Also folds in the README reframe as "spend
+firewall" positioning and the standalone P0-1/P0-2 quick fix that landed
+between v0.2.0 and this release. Backwards-compatible: existing
+`customer_limits` rows and `monthly_cap_usd` keep working unchanged.
+
 ### Added
 
 - **Project default customer limits** — eight new `default_*` columns on
@@ -199,37 +249,77 @@ full methodology, query, and Linux-vs-macOS comparison.
   from `schema.sql`. Both are now declared in the table DDL and
   re-added by an idempotent `ADD COLUMN IF NOT EXISTS` block.
 
-### Planned
+### Upgrade notes
 
-- **Scheduler heartbeat table** to close the v0.1.1 paper cut where
-  `SELECT count(*) FROM system_logs` returns zero on a fresh install
-  even though the scheduler is healthy. See
-  [`design/background-workers.md`](../design/background-workers.md#candidate-fix-for-v012)
-  for the proposed `scheduler_heartbeat` design.
-- **`manage_limits.sh` auto-invalidates the API-key auth cache** after
-  UPDATEs to `projects` (cap, rate limit, cache flags). Today an
-  operator has to manually `DEL apikey:*` for changes to propagate
-  faster than `CACHE_TTL_SECONDS` (default 1 hour). See
-  [`design/enforcement-and-caching.md`](../design/enforcement-and-caching.md)
-  → "Propagation delay on config changes".
+The release introduces new tables, new columns, and one type widen.
+Everything is idempotent — re-running `schema.sql` against a v0.1.x
+deployment is safe.
 
-### Candidates (not committed)
+```bash
+git pull
+docker compose build gateway
 
-These are loose ideas — promote to **Planned** when confirmed:
+# Apply additive schema + DECIMAL widen (idempotent, metadata-only)
+docker compose exec -T postgres psql -U llm0 -d llm0_gateway \
+  -f /docker-entrypoint-initdb.d/01_schema.sql
 
-- Prometheus `/metrics` endpoint (counters for provider/model/status,
-  latency histograms, cache hit rate, failover count, cost total).
-- Add `xai-*` (Grok) provider — prefix-based routing is already in
-  place.
-- Add `deepseek-*` provider via their OpenAI-compatible endpoint.
-- `/v1/embeddings` proxy so users can use the bundled embedding service
-  through the same auth/rate-limit/spend-cap plumbing.
-- Publish pre-built Docker images to GHCR.
-- Document streaming integration recipes (LangChain, LlamaIndex, Vercel
-  AI SDK) in `docs/integrations/`.
-- Switch Redis `maxmemory-policy` from `allkeys-lru` to `noeviction` (or
-  a key-prefix-aware alternative) so `spend:*` counters can't be evicted
-  under memory pressure.
+# Rebuild + restart so the new %.6f formatting and resolver land
+docker compose up -d
+docker compose exec -T redis redis-cli FLUSHDB
+```
+
+Notes:
+
+- **Cap behavior is unchanged for existing setups.** If you've already
+  configured per-customer rows in `customer_limits`, they keep working —
+  the resolver only looks at tier / project default when no per-customer
+  row exists.
+- **Old caps preserved exactly.** A `monthly_cap_usd = $20.00` row stays
+  `$20.00` after the `DECIMAL(14,6)` widen. Only new writes can use sub-cent
+  precision.
+- **`FLUSHDB` is required** to drop the cached `CachedAPIKey` blobs
+  (which carried the old default values). Without it, the gateway keeps
+  serving requests with stale project defaults until the Redis TTL
+  expires (default 1h).
+- **No env vars added** — `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` now also
+  governs the in-process `customer_tiers` cache (same ~60s TTL).
+- **Header format change** — `X-Customer-Limit-Daily` was 2 decimals
+  (`0.01`), now 6 (`0.010000`). Anything parsing these as fixed-width
+  decimals needs adjusting.
+
+---
+
+## [0.2.0] — 2026-05-28
+
+Repository transfer + module path rename. No API surface or schema
+changes — purely an addressability move ahead of the spend-firewall
+reframe.
+
+### Changed
+
+- **Renamed Go module and repository** from
+  `github.com/mrmushfiq/llm0-gateway` to `github.com/llm0ai/llm0`.
+  Update clone URLs, `go.mod` import paths in dependent projects, and
+  the compiled binary name (`llm0`). Old `mrmushfiq/llm0-gateway`
+  module paths no longer resolve via `go get`; existing checkouts keep
+  working until you run `go mod tidy`.
+- **README reframed as a spend firewall** rather than a generic LLM
+  gateway. Headline, feature ordering, and the comparison table now
+  lead with cost containment (the wedge); routing/cache/failover
+  remain documented but as supporting capabilities. No code change.
+
+### Upgrade notes
+
+```bash
+# In any dependent Go project
+go mod edit -replace github.com/mrmushfiq/llm0-gateway=github.com/llm0ai/llm0
+# or, cleaner:
+sed -i 's|mrmushfiq/llm0-gateway|llm0ai/llm0|g' go.mod
+go mod tidy
+```
+
+The Docker Compose / OSS deployment path is unchanged — pull the new
+repo and rebuild, no schema migration.
 
 ---
 
@@ -322,7 +412,9 @@ embedding image are unchanged.
 
 ---
 
-[Unreleased]: https://github.com/llm0ai/llm0/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/llm0ai/llm0/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/llm0ai/llm0/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/llm0ai/llm0/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/llm0ai/llm0/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/llm0ai/llm0/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/llm0ai/llm0/releases/tag/v0.1.1
