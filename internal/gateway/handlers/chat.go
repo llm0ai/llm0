@@ -241,6 +241,11 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 
 	// Step 2: Check customer rate limits (if customer_id provided)
 	customerID := c.GetHeader("X-Customer-ID")
+	// X-Customer-Tier is an owner-defined slug (e.g. 'free', 'pro') the
+	// project owner attaches to each request. Treated as server-to-server
+	// trust input — never accept from untrusted browser clients. See
+	// plans/customer-limits-tiers.md.
+	customerTier := c.GetHeader("X-Customer-Tier")
 	var customerLabels models.Labels
 	var customerLimitCheck *ratelimit.CheckResult
 
@@ -267,6 +272,8 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 			Model:      req.Model,
 			CostUSD:    estimatedCost,
 			Labels:     customerLabels,
+			Tier:       customerTier,
+			APIKey:     apiKey,
 		})
 		if err != nil {
 			fmt.Printf("⚠️ Customer rate limit check failed: %v (fail-open)\n", err)
@@ -287,10 +294,10 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 		// Add customer spend headers (even if allowed)
 		if customerLimitCheck != nil {
 			if customerLimitCheck.DailySpendLimit != nil {
-				c.Header("X-Customer-Spend-Today", fmt.Sprintf("%.4f", customerLimitCheck.DailySpend))
-				c.Header("X-Customer-Limit-Daily", fmt.Sprintf("%.2f", *customerLimitCheck.DailySpendLimit))
+				c.Header("X-Customer-Spend-Today", fmt.Sprintf("%.6f", customerLimitCheck.DailySpend))
+				c.Header("X-Customer-Limit-Daily", fmt.Sprintf("%.6f", *customerLimitCheck.DailySpendLimit))
 				remaining := *customerLimitCheck.DailySpendLimit - customerLimitCheck.DailySpend
-				c.Header("X-Customer-Remaining-Usd", fmt.Sprintf("%.4f", remaining))
+				c.Header("X-Customer-Remaining-Usd", fmt.Sprintf("%.6f", remaining))
 			}
 
 			// Add custom warning headers
@@ -492,6 +499,8 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 			Model:      failoverResult.FinalModel,
 			CostUSD:    actualCost,
 			Labels:     customerLabels,
+			Tier:       customerTier,
+			APIKey:     apiKey,
 		}
 		go func() {
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
