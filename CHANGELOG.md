@@ -113,11 +113,91 @@ full methodology, query, and Linux-vs-macOS comparison.
 
 ## [Unreleased]
 
+### Added
+
+- **Project default customer limits** — eight new `default_*` columns on
+  the `projects` table (`default_daily_spend_limit_usd`,
+  `default_monthly_spend_limit_usd`, `default_per_request_max_usd`,
+  `default_requests_per_{minute,hour,day}`, `default_on_limit_behavior`,
+  `default_downgrade_model`). Apply to every end-user in the project
+  without an `INSERT` into `customer_limits`. Managed via the new
+  `scripts/manage_project_defaults.sh` (interactive list/set/clear).
+- **Customer tiers** — new `customer_tiers` table holds owner-defined
+  plans (`free`, `pro`, `enterprise`, any string slug). Customers attach
+  to a tier via the **`X-Customer-Tier`** request header (server-to-server
+  trust input). Tier limits override project defaults. Managed via the
+  new `scripts/manage_tiers.sh` (list/create/update/delete with UPSERT).
+- **Resolver precedence on every request:** tier → project default →
+  per-customer override → unlimited. Unknown tier slugs silently fall
+  through to the default (typo-resistant). See
+  `internal/shared/database/resolver.go` and the new
+  `customer_tiers_cache.go` (~60s in-process TTL).
+- **Customer auto-provisioning** — `customer_spend` rows are upserted on
+  the first request carrying a given `X-Customer-ID`. SaaS owners never
+  `INSERT` customers by hand.
+- **`LimitSpec` shared cap type** — single struct embedded in both
+  `CustomerLimit` and `CustomerTier`, so the limiter, resolver, and
+  helpers all speak the same language.
+- **`CachedAPIKey` carries project defaults** — defaults are read at
+  auth time and Redis-cached alongside the API key (no extra hot-path
+  query). The limiter resolves caps in-memory.
+- Unit tests for `LimitSpec`, `CachedAPIKey.ProjectDefaultLimitSpec()`,
+  and `ResolveCustomerLimit` precedence
+  (`internal/shared/models/customer_limits_test.go`,
+  `internal/shared/database/resolver_test.go`).
+- `test_guide/cost-control-slice-a.md` — end-to-end local test guide
+  covering project defaults, tiers, streaming enforcement, downgrade
+  swap, and the μUSD precision floor.
+
 ### Changed
 
+- **All USD cap/spend columns widened to `DECIMAL(14,6)` (μUSD
+  precision).** `projects.{monthly_cap_usd,current_month_spend_usd,
+  default_*_usd}`, `customer_limits.*_usd`, `customer_tiers.*_usd`,
+  `gateway_logs.cost_usd`, `customer_spend.total_spend_usd`. Sub-cent
+  caps (down to `$0.000001`) now work — previously anything below
+  `$0.005` rounded to `$0.00`. Helper functions
+  `get_customer_{daily,monthly}_spend` updated to match. Idempotent
+  `ALTER COLUMN … TYPE DECIMAL(14,6)` migration block at the bottom of
+  `schema/schema.sql` widens existing OSS deployments in place
+  (metadata-only on PG 9.2+).
+- **All USD values rendered with `%.6f`** in response headers
+  (`X-Customer-Spend-Today`, `X-Customer-Limit-Daily`,
+  `X-Customer-Remaining-Usd`) and 429 error messages
+  (`"daily spend limit exceeded (current: $X.XXXXXX, limit: $Y.YYYYYY)"`).
+  Previously a mix of `%.2f` / `%.4f`.
+- **Streaming pre-call cost estimate uses real prompt size + `max_tokens`**
+  (`internal/gateway/handlers/chat_stream.go`). Was a flat 1000-token
+  guess regardless of payload size, which mis-estimated tiny prompts by
+  50× and oversized prompts by 100×. The non-streaming path already did
+  this; streaming now matches.
 - **Renamed Go module and repository** from `github.com/mrmushfiq/llm0-gateway`
   to `github.com/llm0ai/llm0`. Update clone URLs, import paths, and the
   compiled binary name (`llm0`). Old Go module paths no longer resolve.
+
+### Fixed
+
+- **Streaming endpoint enforces per-customer caps.** Before this
+  release, `"stream": true` requests bypassed the customer limiter
+  entirely — projects with daily caps configured for non-stream were
+  still bleeding money on streamed calls from the same end-user.
+  `chat_stream.go` now calls `customerLimiter.Check`, applies
+  block/downgrade, and writes spend headers before opening the SSE
+  stream. (Internal tracking: **P0-1**.)
+- **`downgrade` behavior actually swaps the model.** The
+  `on_limit_behavior = 'downgrade'` path was wired through the
+  resolver/limiter but the handlers never read
+  `customerLimitCheck.DowngradeModel` — `block` and `downgrade` were
+  effectively the same. Both `chat.go` and `chat_stream.go` now
+  `applyCustomerDowngrade(...)` and rebuild the failover chain around
+  the cheaper model; the response carries `X-Downgraded: true` and
+  `X-Downgraded-Model: <original>`. Tier-level downgrade also works.
+  (Internal tracking: **P0-2**.)
+- **Schema drift on `label_limits` / `spend_by_label`.** Go code read
+  `customer_limits.label_limits` (JSONB, per-label daily caps) and
+  wrote `customer_spend.spend_by_label`, but the columns were missing
+  from `schema.sql`. Both are now declared in the table DDL and
+  re-added by an idempotent `ADD COLUMN IF NOT EXISTS` block.
 
 ### Planned
 

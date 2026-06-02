@@ -69,6 +69,36 @@ On a failover, you'll also see `X-Failover: true` and `X-Original-Provider: <nam
 
 Switch `gpt-4o-mini` for `claude-haiku-4-5-20251001`, `gemini-2.0-flash`, or any local Ollama model (`llama3.3`, `qwen2.5`, `gemma3`, …) — same endpoint, no code changes in your application.
 
+### Add the spend firewall
+
+The firewall layer activates the moment you pass `X-Customer-ID` (your end-user identifier) and configure a default. One SQL update (or one shell-script run) sets a daily spend cap that applies to **every** end-user — no per-customer rows to write:
+
+```bash
+# Set a $0.01/day default for all end-users in this project
+./scripts/manage_project_defaults.sh set
+
+# Then route requests through the firewall, tagging the end-user:
+curl -i http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer llm0_live_..." \
+  -H "X-Customer-ID: alice@acme.com" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Response now includes per-customer enforcement headers (μUSD precision):
+
+```http
+HTTP/1.1 200 OK
+X-Cost-Usd: 0.000435
+X-Customer-Limit-Daily: 0.010000      ← cap in effect for this user today
+X-Customer-Spend-Today: 0.000000      ← snapshot at request time
+X-Customer-Remaining-Usd: 0.010000    ← budget left before block / downgrade
+X-Provider: openai
+...
+```
+
+Once `X-Customer-Spend-Today` would cross `X-Customer-Limit-Daily`, the next request returns **429 with `customer_rate_limit_exceeded`** — or auto-downgrades to a cheaper model if you set `default_on_limit_behavior=downgrade`. Tiered pricing? Define a `pro` / `enterprise` tier with `./scripts/manage_tiers.sh` and attach via the `X-Customer-Tier` header. See [Per-Customer Spend Limits](#3-per-customer-spend-limits-recommended-path) below for the full picture.
+
 ### At a glance
 
 | | |
@@ -206,11 +236,22 @@ Response headers included on every call:
 When the limit is exceeded, the gateway returns `429` with a `retry_after` field.
 
 ### Per-Customer Spend Caps
-Pass `X-Customer-ID` on any request to enable per-end-user daily and monthly USD spend limits. Limits are stored in the `customer_limits` table and support two overflow behaviors:
-- `block` — return `429` with spend details and how much longer until reset
-- `downgrade` — automatically route to a cheaper model (e.g. `gpt-4o` → `gpt-4o-mini`)
+Pass `X-Customer-ID` on any request to enable per-end-user daily/monthly USD spend caps, daily/monthly/per-request count caps, per-model and per-label caps. The gateway resolves the effective limit on every request via a three-step precedence (first match wins):
 
-Customer labels (`X-LLM0-Tier: pro`, `X-LLM0-Team: billing`, …) are stored as JSONB on every request log for downstream analytics.
+1. **`X-Customer-Tier`** — owner-defined plan (`free`, `pro`, `enterprise`, anything you name). Defined in the `customer_tiers` table via `./scripts/manage_tiers.sh`.
+2. **Project defaults** — `projects.default_*` columns. One UPDATE applies to every end-user in the project. Set via `./scripts/manage_project_defaults.sh`.
+3. **Per-customer override** — a row in `customer_limits` (legacy / power-user; rarely needed since defaults + tiers cover most cases).
+
+If none of the above resolves to a cap, the customer is unlimited. Customer rows in `customer_spend` are **auto-created on first request** — you never INSERT them by hand.
+
+Both spend caps and request-count caps support three overflow behaviors:
+- `block` — return `429` with spend details and how much longer until reset
+- `downgrade` — automatically route to a cheaper model (e.g. `gpt-4o` → `gpt-4o-mini`), set via `default_downgrade_model` or the tier's `downgrade_model`
+- `warn` — let the request through but add `X-Warning` header at 80%+ utilization
+
+All USD columns are `DECIMAL(14,6)` (μUSD precision) so sub-cent caps like `$0.001/day` work without rounding. Spend headers (`X-Customer-Spend-Today`, `X-Customer-Limit-Daily`, `X-Customer-Remaining-Usd`) are rendered with 6 decimals.
+
+Customer labels (`X-LLM0-Tier: pro`, `X-LLM0-Team: billing`, …) are stored as JSONB on every request log for downstream analytics, independent of `X-Customer-Tier` (which drives enforcement).
 
 ### Hard Project Spend Cap
 Set `monthly_cap_usd` on a project and requests are blocked with `402 Payment Required` once the cap is hit. Checked **before** the LLM call using cost estimation, so runaway prompts can't silently exceed the cap.
@@ -863,12 +904,22 @@ Every response includes diagnostic headers:
 | `X-Cache-Hit` | `exact`, `semantic`, or `miss` |
 | `X-Cache-Similarity` | Cosine similarity score (semantic hits only) |
 | `X-Provider` | Which provider served the response |
-| `X-Cost-USD` | Actual cost of the request |
+| `X-Cost-USD` | Actual cost of the request (μUSD precision, `%.6f`) |
 | `X-Tokens-Prompt` | Prompt token count |
 | `X-Tokens-Completion` | Completion token count |
 | `X-RateLimit-Remaining` | Requests remaining in current window |
 | `X-Failover` | `true` if failover occurred |
 | `X-Original-Provider` | Provider that was tried first (on failover) |
+
+When `X-Customer-ID` is sent and a daily/monthly cap resolves for that customer (via tier, project default, or `customer_limits` row), three extra headers are added — pre-call snapshot, useful for client-side backpressure:
+
+| Header | Description |
+|---|---|
+| `X-Customer-Spend-Today` | Daily spend so far, `%.6f` μUSD |
+| `X-Customer-Limit-Daily` | The daily cap that applies — tier > project default > per-customer override |
+| `X-Customer-Remaining-Usd` | `Limit-Daily − Spend-Today`, the budget left for this user today |
+
+On a `downgrade` cap, the response also carries `X-Downgraded: true` and `X-Downgraded-Model: <original>`; the response body's `model` field reflects the cheaper model the request actually ran on.
 
 ---
 
@@ -909,8 +960,80 @@ Each project has a `monthly_cap_usd` column. The gateway **estimates** the reque
 ./scripts/manage_limits.sh set-project-cap
 ```
 
-### 3. Per-Customer Spend Limits (daily + monthly USD)
-Set limits per end-user via the `customer_limits` table. The interactive script handles upsert logic, validation, and NULL handling for you:
+### 3. Per-Customer Spend Limits (recommended path)
+
+A SaaS owner shouldn't have to write a DB row per end-user. The gateway resolves limits with a three-step precedence on every request (first match wins):
+
+```
+  X-Customer-Tier (customer_tiers row)
+      └─ falls through to ─┐
+              projects.default_*  (one-time project setup)
+                  └─ falls through to ─┐
+                          customer_limits row  (rare / power-user override)
+                              └─ falls through to ─┐
+                                              unlimited
+```
+
+For most products you set the **project default once** and call it a day. Tiers come in when you want plan-based pricing (`free` / `pro` / `enterprise`). Per-customer overrides exist for edge cases.
+
+**Customer rows are auto-created.** The gateway upserts a `customer_spend` row on the first request carrying a given `X-Customer-ID`. You never `INSERT` into `customer_spend` by hand.
+
+#### a) Project default — one-line catch-all
+
+Apply to every end-user in the project. Recommended starting point.
+
+```bash
+./scripts/manage_project_defaults.sh set
+# Project ID: <paste>
+# default_daily_spend_limit_usd   : 0.01       ← μUSD precision, sub-cent OK
+# default_monthly_spend_limit_usd : 1.00
+# default_per_request_max_usd     : 0.10       ← circuit breaker
+# default_requests_per_minute     : 60
+# default_on_limit_behavior       : block      ← or 'downgrade'
+# default_downgrade_model         : gpt-4o-mini
+```
+
+Or via SQL:
+
+```sql
+UPDATE projects SET
+  default_daily_spend_limit_usd = 0.01,
+  default_on_limit_behavior     = 'block'
+WHERE id = '<project-id>';
+```
+
+Changes propagate after the Redis API-key cache refreshes (≤ `CACHE_TTL_SECONDS`, default 1h). To force immediate pickup: `docker compose exec -T redis redis-cli FLUSHDB`.
+
+#### b) Tiers — plan-based pricing
+
+LLM0 has **no built-in tier names** — owner-defined slugs (`free`, `pro`, `enterprise`, `internal`, `1`, `2`, …). Define each tier's caps once, then attach via `X-Customer-Tier` per request.
+
+```bash
+./scripts/manage_tiers.sh create
+# Project ID: <paste>
+# Tier slug: pro
+# daily_spend_limit_usd : 10.00
+# monthly_spend_limit_usd : 100.00
+# on_limit_behavior : block
+```
+
+Then on every request your server sends:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer llm0_live_..." \
+  -H "X-Customer-ID: user_123" \
+  -H "X-Customer-Tier: pro" \
+  ...
+```
+
+> **`X-Customer-Tier` is server-to-server only** — derive it from your auth/billing system before forwarding to the gateway. Never accept it from an untrusted browser client.
+
+Unknown tier slugs silently fall through to the project default (typo-resistant, no error).
+
+#### c) Per-customer override — legacy / edge cases
+
+A row in `customer_limits` overrides both project defaults and tiers. Use for VIPs, special-case unlimited accounts, or hand-tuned bans.
 
 ```bash
 ./scripts/manage_limits.sh set-customer-limit
@@ -924,28 +1047,23 @@ INSERT INTO customer_limits (
     daily_spend_limit_usd, monthly_spend_limit_usd,
     on_limit_behavior, downgrade_model
 ) VALUES (
-    '<your-project-id>',
-    'user_123',
-    1.00,          -- $1 per day
-    20.00,         -- $20 per month
-    'downgrade',   -- 'block' or 'downgrade'
-    'gpt-4o-mini'  -- used when on_limit_behavior = 'downgrade'
+    '<project-id>', 'user_123',
+    1.00, 20.00,
+    'downgrade', 'gpt-4o-mini'
 );
 ```
 
-Then pass the customer ID on requests:
+Per-customer rows are an escape hatch — if you find yourself writing many of them, switch to tiers.
 
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer llm0_live_..." \
-  -H "X-Customer-ID: user_123" \
-  ...
-```
+#### Response headers (any cap path)
 
-Spend headers are included in every response:
-- `X-Customer-Spend-Today`
-- `X-Customer-Limit-Daily`
-- `X-Customer-Remaining-Usd`
+Every response under `X-Customer-ID` carries the pre-call snapshot:
+
+- `X-Customer-Spend-Today` — μUSD precision, `%.6f`
+- `X-Customer-Limit-Daily` — the resolved cap (from whichever level matched)
+- `X-Customer-Remaining-Usd` — `Limit-Daily − Spend-Today`
+
+On a `downgrade` cap, also: `X-Downgraded: true` and `X-Downgraded-Model: <original-model>`.
 
 ### How Spend Caps Reset
 
@@ -1025,7 +1143,9 @@ All scheduled jobs run as in-process Go goroutines — no cron, no sidecar conta
 
 The gateway tracks cost in two places: **before** the call (for spend-cap enforcement) and **after** the call (for actual billing).
 
-**1. Pricing source** — the `model_pricing` table, one row per `(provider, model)` pair with `input_per_1k_tokens` and `output_per_1k_tokens`. Pricing is loaded into memory at startup — restart the gateway after updates via `./scripts/manage_models.sh`.
+**1. Pricing source** — the `model_pricing` table, one row per `(provider, model)` pair with `input_per_1k_tokens` and `output_per_1k_tokens` (`DECIMAL(10,8)` — 10nUSD precision). Pricing is loaded into memory at startup — restart the gateway after updates via `./scripts/manage_models.sh`.
+
+**Storage precision** — `gateway_logs.cost_usd`, `customer_spend.total_spend_usd`, and every USD cap column (`projects.monthly_cap_usd`, `projects.default_*_usd`, `customer_limits.*_usd`, `customer_tiers.*_usd`) are all `DECIMAL(14,6)` — μUSD precision. A single `gpt-4o-mini` token costs ~$0.00000015, so 6 decimals is enough to represent any realistic cap or request cost without rounding loss. Caps and headers are rendered with `%.6f` end-to-end.
 
 **2. Cost formula** — applied identically in every path:
 
@@ -1328,8 +1448,10 @@ Areas where contributions are especially useful:
 - Additional embedding models for semantic cache
 - Per-model-class routing rules (e.g. "always route coding tasks to X")
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for what shipped in the current release
-(v0.1.1) and what's planned for the next patch (v0.1.2).
+See [`CHANGELOG.md`](./CHANGELOG.md) for the full release history. The
+current `[Unreleased]` block tracks the spend-firewall expansion: project
+default customer limits, owner-defined tiers (`X-Customer-Tier`), and
+μUSD-precision (`DECIMAL(14,6)`) USD storage end-to-end.
 
 ---
 
