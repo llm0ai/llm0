@@ -78,12 +78,12 @@ func (ll *LabelLimits) Scan(value interface{}) error {
 	return json.Unmarshal(bytes, ll)
 }
 
-// CustomerLimit defines rate limit configuration for an end-user
-type CustomerLimit struct {
-	ID         uuid.UUID `db:"id"`
-	ProjectID  uuid.UUID `db:"project_id"`
-	CustomerID string    `db:"customer_id"`
-
+// LimitSpec is the shared cap/policy bundle that can be sourced from a
+// per-customer override row (CustomerLimit), an owner-defined CustomerTier,
+// or project default columns (projects.default_*). The limiter's evaluation
+// path operates on *LimitSpec only — it doesn't care which source produced
+// the values. See plans/customer-limits-tiers.md for the resolution rule.
+type LimitSpec struct {
 	// Cost-based limits
 	DailySpendLimitUSD   *float64 `db:"daily_spend_limit_usd"`
 	MonthlySpendLimitUSD *float64 `db:"monthly_spend_limit_usd"`
@@ -101,41 +101,44 @@ type CustomerLimit struct {
 	// Behavior on limit
 	OnLimitBehavior LimitBehavior `db:"on_limit_behavior"`
 	DowngradeModel  *string       `db:"downgrade_model"`
-
-	CreatedAt time.Time `db:"created_at"`
-	UpdatedAt time.Time `db:"updated_at"`
 }
 
 // HasCostLimit returns true if any cost-based limit is configured
-func (cl *CustomerLimit) HasCostLimit() bool {
-	return cl.DailySpendLimitUSD != nil ||
-		cl.MonthlySpendLimitUSD != nil ||
-		cl.PerRequestMaxUSD != nil
+func (l *LimitSpec) HasCostLimit() bool {
+	if l == nil {
+		return false
+	}
+	return l.DailySpendLimitUSD != nil ||
+		l.MonthlySpendLimitUSD != nil ||
+		l.PerRequestMaxUSD != nil
 }
 
 // HasRequestLimit returns true if any request-based limit is configured
-func (cl *CustomerLimit) HasRequestLimit() bool {
-	return cl.RequestsPerMinute != nil ||
-		cl.RequestsPerHour != nil ||
-		cl.RequestsPerDay != nil
+func (l *LimitSpec) HasRequestLimit() bool {
+	if l == nil {
+		return false
+	}
+	return l.RequestsPerMinute != nil ||
+		l.RequestsPerHour != nil ||
+		l.RequestsPerDay != nil
 }
 
 // HasModelLimit returns true if a limit exists for the specified model
-func (cl *CustomerLimit) HasModelLimit(model string) bool {
-	if cl.ModelLimits == nil {
+func (l *LimitSpec) HasModelLimit(model string) bool {
+	if l == nil || l.ModelLimits == nil {
 		return false
 	}
-	_, exists := cl.ModelLimits[model]
+	_, exists := l.ModelLimits[model]
 	return exists
 }
 
-// GetModelLimit returns the request limit for a specific model
-// Returns (limit, hasLimit)
-func (cl *CustomerLimit) GetModelLimit(model string) (int, bool) {
-	if cl.ModelLimits == nil {
+// GetModelLimit returns the request limit for a specific model.
+// Returns (limit, hasLimit).
+func (l *LimitSpec) GetModelLimit(model string) (int, bool) {
+	if l == nil || l.ModelLimits == nil {
 		return 0, false
 	}
-	limit, exists := cl.ModelLimits[model]
+	limit, exists := l.ModelLimits[model]
 	if !exists || limit == nil {
 		return 0, false
 	}
@@ -143,21 +146,64 @@ func (cl *CustomerLimit) GetModelLimit(model string) (int, bool) {
 }
 
 // HasLabelLimit returns true if a limit exists for the specified label
-func (cl *CustomerLimit) HasLabelLimit(labelKey string) bool {
-	if cl.LabelLimits == nil {
+func (l *LimitSpec) HasLabelLimit(labelKey string) bool {
+	if l == nil || l.LabelLimits == nil {
 		return false
 	}
-	_, exists := cl.LabelLimits[labelKey]
+	_, exists := l.LabelLimits[labelKey]
 	return exists
 }
 
 // GetLabelLimit returns the request limit for a specific label
-func (cl *CustomerLimit) GetLabelLimit(labelKey string) (int, bool) {
-	if cl.LabelLimits == nil {
+func (l *LimitSpec) GetLabelLimit(labelKey string) (int, bool) {
+	if l == nil || l.LabelLimits == nil {
 		return 0, false
 	}
-	limit, exists := cl.LabelLimits[labelKey]
+	limit, exists := l.LabelLimits[labelKey]
 	return limit, exists
+}
+
+// IsEmpty returns true if no cap of any kind is configured. Useful to skip
+// allocating a spec when project defaults / tier rows have all-NULL columns.
+func (l *LimitSpec) IsEmpty() bool {
+	if l == nil {
+		return true
+	}
+	return !l.HasCostLimit() &&
+		!l.HasRequestLimit() &&
+		len(l.ModelLimits) == 0 &&
+		len(l.LabelLimits) == 0
+}
+
+// CustomerLimit defines a per-customer override row (project_id × customer_id).
+// All cap fields are inherited via the embedded LimitSpec, so existing code
+// that reads e.g. limit.DailySpendLimitUSD or calls limit.HasCostLimit()
+// continues to work unchanged. Per-customer overrides are managed-cloud only
+// in OSS Slice A; project defaults + tiers handle every OSS use case.
+type CustomerLimit struct {
+	ID         uuid.UUID `db:"id"`
+	ProjectID  uuid.UUID `db:"project_id"`
+	CustomerID string    `db:"customer_id"`
+
+	LimitSpec
+
+	CreatedAt time.Time `db:"created_at"`
+	UpdatedAt time.Time `db:"updated_at"`
+}
+
+// CustomerTier is an owner-defined "plan" (e.g. 'free', 'pro', or any slug
+// the owner picks). Customers carry their tier via the X-Customer-Tier
+// request header. Names are NOT predefined by LLM0; the owner manages them
+// via scripts/manage_tiers.sh (OSS) or the managed dashboard.
+type CustomerTier struct {
+	ID        uuid.UUID `db:"id"`
+	ProjectID uuid.UUID `db:"project_id"`
+	Slug      string    `db:"slug"`
+
+	LimitSpec
+
+	CreatedAt time.Time `db:"created_at"`
+	UpdatedAt time.Time `db:"updated_at"`
 }
 
 // ============================================================================

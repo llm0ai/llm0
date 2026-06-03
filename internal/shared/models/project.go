@@ -53,7 +53,45 @@ type CachedAPIKey struct {
 	SemanticThreshold    float64 `json:"semantic_threshold"`
 	CacheTTL             int     `json:"cache_ttl"`
 
+	// Per-customer DEFAULT limits inherited from the project row. All
+	// nullable — present only when the project owner has configured a default
+	// via scripts/manage_project_defaults.sh or the managed dashboard. Cached
+	// here so ResolveCustomerLimit() costs ZERO extra queries on the hot path.
+	DefaultDailySpendLimitUSD   *float64 `json:"default_daily_spend_limit_usd,omitempty"`
+	DefaultMonthlySpendLimitUSD *float64 `json:"default_monthly_spend_limit_usd,omitempty"`
+	DefaultPerRequestMaxUSD     *float64 `json:"default_per_request_max_usd,omitempty"`
+	DefaultRequestsPerMinute    *int     `json:"default_requests_per_minute,omitempty"`
+	DefaultRequestsPerHour      *int     `json:"default_requests_per_hour,omitempty"`
+	DefaultRequestsPerDay       *int     `json:"default_requests_per_day,omitempty"`
+	DefaultOnLimitBehavior      *string  `json:"default_on_limit_behavior,omitempty"`
+	DefaultDowngradeModel       *string  `json:"default_downgrade_model,omitempty"`
+
 	CachedAt time.Time `json:"cached_at"`
+}
+
+// ProjectDefaultLimitSpec builds a LimitSpec from the cached project default
+// columns. Returns nil if no default is configured (all cap fields NULL).
+// Centralized here so callers don't reach into individual default_* fields.
+func (k *CachedAPIKey) ProjectDefaultLimitSpec() *LimitSpec {
+	if k == nil {
+		return nil
+	}
+	spec := &LimitSpec{
+		DailySpendLimitUSD:   k.DefaultDailySpendLimitUSD,
+		MonthlySpendLimitUSD: k.DefaultMonthlySpendLimitUSD,
+		PerRequestMaxUSD:     k.DefaultPerRequestMaxUSD,
+		RequestsPerMinute:    k.DefaultRequestsPerMinute,
+		RequestsPerHour:      k.DefaultRequestsPerHour,
+		RequestsPerDay:       k.DefaultRequestsPerDay,
+		DowngradeModel:       k.DefaultDowngradeModel,
+	}
+	if k.DefaultOnLimitBehavior != nil {
+		spec.OnLimitBehavior = LimitBehavior(*k.DefaultOnLimitBehavior)
+	}
+	if spec.IsEmpty() {
+		return nil
+	}
+	return spec
 }
 
 // GatewayLog represents a single logged LLM request for analytics.

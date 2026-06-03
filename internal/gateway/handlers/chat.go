@@ -241,6 +241,11 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 
 	// Step 2: Check customer rate limits (if customer_id provided)
 	customerID := c.GetHeader("X-Customer-ID")
+	// X-Customer-Tier is an owner-defined slug (e.g. 'free', 'pro') the
+	// project owner attaches to each request. Treated as server-to-server
+	// trust input — never accept from untrusted browser clients. See
+	// plans/customer-limits-tiers.md.
+	customerTier := c.GetHeader("X-Customer-Tier")
 	var customerLabels models.Labels
 	var customerLimitCheck *ratelimit.CheckResult
 
@@ -267,6 +272,8 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 			Model:      req.Model,
 			CostUSD:    estimatedCost,
 			Labels:     customerLabels,
+			Tier:       customerTier,
+			APIKey:     apiKey,
 		})
 		if err != nil {
 			fmt.Printf("⚠️ Customer rate limit check failed: %v (fail-open)\n", err)
@@ -287,10 +294,10 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 		// Add customer spend headers (even if allowed)
 		if customerLimitCheck != nil {
 			if customerLimitCheck.DailySpendLimit != nil {
-				c.Header("X-Customer-Spend-Today", fmt.Sprintf("%.4f", customerLimitCheck.DailySpend))
-				c.Header("X-Customer-Limit-Daily", fmt.Sprintf("%.2f", *customerLimitCheck.DailySpendLimit))
+				c.Header("X-Customer-Spend-Today", fmt.Sprintf("%.6f", customerLimitCheck.DailySpend))
+				c.Header("X-Customer-Limit-Daily", fmt.Sprintf("%.6f", *customerLimitCheck.DailySpendLimit))
 				remaining := *customerLimitCheck.DailySpendLimit - customerLimitCheck.DailySpend
-				c.Header("X-Customer-Remaining-Usd", fmt.Sprintf("%.4f", remaining))
+				c.Header("X-Customer-Remaining-Usd", fmt.Sprintf("%.6f", remaining))
 			}
 
 			// Add custom warning headers
@@ -298,6 +305,17 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 				c.Header(k, v)
 			}
 		}
+	}
+
+	// Step 2b: Apply downgrade if the customer hit a spend cap configured with
+	// on_limit_behavior = "downgrade". Route to the cheaper model and rebuild
+	// the failover chain for it. Everything after this point (cache keys, cost
+	// estimate, execution, logging) uses the downgraded model.
+	if newProviderName, ok := h.applyCustomerDowngrade(customerLimitCheck, &req); ok {
+		providerName = newProviderName
+		chain = failover.GetFailoverChain(req.Model, h.cfg)
+		c.Header("X-Downgraded", "true")
+		c.Header("X-Downgraded-Model", req.Model)
 	}
 
 	// Step 3: Check exact match cache (if enabled)
@@ -481,6 +499,8 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 			Model:      failoverResult.FinalModel,
 			CostUSD:    actualCost,
 			Labels:     customerLabels,
+			Tier:       customerTier,
+			APIKey:     apiKey,
 		}
 		go func() {
 			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -640,6 +660,33 @@ func estimatePromptTokens(messages []openai.ChatCompletionMessage) int {
 		tokens = 10 // floor so empty-ish prompts don't round to zero
 	}
 	return tokens
+}
+
+// applyCustomerDowngrade swaps req.Model to the customer's configured cheaper
+// model when the limiter signaled a downgrade (on_limit_behavior =
+// "downgrade" and a spend cap would otherwise be exceeded). It returns the
+// re-detected provider name and whether a downgrade was applied; the caller is
+// responsible for rebuilding the failover chain for the new model.
+//
+// If the configured downgrade_model isn't recognized by any provider, the
+// downgrade is skipped (the request proceeds on the original model) so a
+// misconfigured downgrade target can't break live traffic.
+func (h *ChatHandler) applyCustomerDowngrade(check *ratelimit.CheckResult, req *providers.ChatRequest) (string, bool) {
+	if check == nil || !check.ShouldDegrade || check.DowngradeModel == nil {
+		return "", false
+	}
+	newModel := strings.TrimSpace(*check.DowngradeModel)
+	if newModel == "" || newModel == req.Model {
+		return "", false
+	}
+	providerName, provider := h.detectProvider(newModel)
+	if provider == nil {
+		fmt.Printf("⚠️ Downgrade model %q not recognized; keeping %q\n", newModel, req.Model)
+		return "", false
+	}
+	fmt.Printf("⬇️  Customer over limit: downgrading %s → %s\n", req.Model, newModel)
+	req.Model = newModel
+	return providerName, true
 }
 
 // estimateRequestCost estimates the USD cost of a request before making it.

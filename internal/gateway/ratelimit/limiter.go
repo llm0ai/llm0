@@ -36,6 +36,17 @@ type CheckRequest struct {
 	Model      string
 	CostUSD    float64
 	Labels     models.Labels // Custom attribution labels
+
+	// Tier carries the X-Customer-Tier header value (an owner-defined slug
+	// such as 'free' or 'pro'). Empty when the request doesn't carry one;
+	// the resolver then falls through to the project default. Names are
+	// chosen entirely by the project owner — LLM0 has no built-in tiers.
+	Tier string
+
+	// APIKey is the request's authenticated key. The limiter reads
+	// `apiKey.ProjectDefaultLimitSpec()` to apply project default limits
+	// without an extra DB query. May be nil in admin/test contexts.
+	APIKey *models.CachedAPIKey
 }
 
 // CheckResult contains the outcome of a rate limit check
@@ -76,13 +87,14 @@ type CheckResult struct {
 // This brings a fully-configured Check from ~5–7 Redis round trips down to
 // 1–2 on the fast path.
 func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, error) {
-	// customer_limits is in-memory cached (see database.customerLimitCache).
-	limit, err := l.db.GetCustomerLimit(ctx, req.ProjectID, req.CustomerID)
+	// Resolve the LimitSpec from the layered sources (tier → project default
+	// → nil). See plans/customer-limits-tiers.md for the resolution rule.
+	spec, err := l.db.ResolveCustomerLimit(ctx, req.ProjectID, req.Tier, req.APIKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get customer limit: %w", err)
+		return nil, fmt.Errorf("failed to resolve customer limit: %w", err)
 	}
 
-	if limit == nil {
+	if spec == nil {
 		return &CheckResult{
 			Allowed: true,
 			Headers: make(map[string]string),
@@ -91,8 +103,8 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 
 	result := &CheckResult{
 		Allowed:           true,
-		DailySpendLimit:   limit.DailySpendLimitUSD,
-		MonthlySpendLimit: limit.MonthlySpendLimitUSD,
+		DailySpendLimit:   spec.DailySpendLimitUSD,
+		MonthlySpendLimit: spec.MonthlySpendLimitUSD,
 		Headers:           make(map[string]string),
 	}
 
@@ -100,7 +112,7 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 	// Always fetch when any cost OR request limit is configured; the extra
 	// keys are free compared to the network cost of a second round trip.
 	var snap *redisClient.CustomerCounterSnapshot
-	if limit.HasCostLimit() || limit.HasRequestLimit() {
+	if spec.HasCostLimit() || spec.HasRequestLimit() {
 		snap, err = l.redis.GetCustomerCounters(ctx, req.ProjectID.String(), req.CustomerID)
 		if err != nil {
 			return nil, fmt.Errorf("fetch customer counters: %w", err)
@@ -108,8 +120,8 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 	}
 
 	// 1. Cost-based limits (no Redis calls — evaluated against snapshot).
-	if limit.HasCostLimit() {
-		if blocked, reason := l.evaluateCostLimits(req, limit, snap, result); blocked {
+	if spec.HasCostLimit() {
+		if blocked, reason := l.evaluateCostLimits(req, spec, snap, result); blocked {
 			result.Allowed = false
 			result.Reason = reason
 			return result, nil
@@ -117,8 +129,8 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 	}
 
 	// 2. Request-based limits (no Redis calls — evaluated against snapshot).
-	if limit.HasRequestLimit() {
-		if blocked, reason := l.evaluateRequestLimits(limit, snap, result); blocked {
+	if spec.HasRequestLimit() {
+		if blocked, reason := l.evaluateRequestLimits(spec, snap, result); blocked {
 			result.Allowed = false
 			result.Reason = reason
 			return result, nil
@@ -126,8 +138,8 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 	}
 
 	// 3. Model-specific limits (separate MGET — only when configured).
-	if limit.HasModelLimit(req.Model) {
-		blocked, reason, err := l.checkModelLimits(ctx, req, limit, result)
+	if spec.HasModelLimit(req.Model) {
+		blocked, reason, err := l.checkModelLimits(ctx, req, spec, result)
 		if err != nil {
 			return nil, err
 		}
@@ -140,7 +152,7 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 
 	// 4. Label-based limits (separate MGET — only when labels present).
 	if len(req.Labels) > 0 {
-		blocked, reason, err := l.checkLabelLimits(ctx, req, limit, result)
+		blocked, reason, err := l.checkLabelLimits(ctx, req, spec, result)
 		if err != nil {
 			return nil, err
 		}
@@ -152,10 +164,10 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 	}
 
 	// 5. Per-request max cost (no network).
-	if limit.PerRequestMaxUSD != nil && req.CostUSD > *limit.PerRequestMaxUSD {
+	if spec.PerRequestMaxUSD != nil && req.CostUSD > *spec.PerRequestMaxUSD {
 		result.Allowed = false
-		result.Reason = fmt.Sprintf("request cost ($%.4f) exceeds per-request limit ($%.2f)",
-			req.CostUSD, *limit.PerRequestMaxUSD)
+		result.Reason = fmt.Sprintf("request cost ($%.6f) exceeds per-request limit ($%.6f)",
+			req.CostUSD, *spec.PerRequestMaxUSD)
 		return result, nil
 	}
 
@@ -166,7 +178,7 @@ func (l *Limiter) Check(ctx context.Context, req *CheckRequest) (*CheckResult, e
 // counter snapshot (no Redis calls).
 func (l *Limiter) evaluateCostLimits(
 	req *CheckRequest,
-	limit *models.CustomerLimit,
+	spec *models.LimitSpec,
 	snap *redisClient.CustomerCounterSnapshot,
 	result *CheckResult,
 ) (blocked bool, reason string) {
@@ -176,34 +188,34 @@ func (l *Limiter) evaluateCostLimits(
 	result.DailySpend = snap.DailySpend
 	result.MonthlySpend = snap.MonthlySpend
 
-	if limit.DailySpendLimitUSD != nil {
-		if snap.DailySpend+req.CostUSD > *limit.DailySpendLimitUSD {
-			if limit.OnLimitBehavior == models.LimitBehaviorDowngrade && limit.DowngradeModel != nil {
+	if spec.DailySpendLimitUSD != nil {
+		if snap.DailySpend+req.CostUSD > *spec.DailySpendLimitUSD {
+			if spec.OnLimitBehavior == models.LimitBehaviorDowngrade && spec.DowngradeModel != nil {
 				result.ShouldDegrade = true
-				result.DowngradeModel = limit.DowngradeModel
+				result.DowngradeModel = spec.DowngradeModel
 				return false, ""
 			}
-			return true, fmt.Sprintf("daily spend limit exceeded (current: $%.4f, limit: $%.2f)",
-				snap.DailySpend, *limit.DailySpendLimitUSD)
+			return true, fmt.Sprintf("daily spend limit exceeded (current: $%.6f, limit: $%.6f)",
+				snap.DailySpend, *spec.DailySpendLimitUSD)
 		}
-		if snap.DailySpend >= *limit.DailySpendLimitUSD*0.8 {
-			pct := (snap.DailySpend / *limit.DailySpendLimitUSD) * 100
+		if snap.DailySpend >= *spec.DailySpendLimitUSD*0.8 {
+			pct := (snap.DailySpend / *spec.DailySpendLimitUSD) * 100
 			result.Headers["X-Warning"] = fmt.Sprintf("Customer approaching daily spend limit (%.0f%%)", pct)
 		}
 	}
 
-	if limit.MonthlySpendLimitUSD != nil {
-		if snap.MonthlySpend+req.CostUSD > *limit.MonthlySpendLimitUSD {
-			if limit.OnLimitBehavior == models.LimitBehaviorDowngrade && limit.DowngradeModel != nil {
+	if spec.MonthlySpendLimitUSD != nil {
+		if snap.MonthlySpend+req.CostUSD > *spec.MonthlySpendLimitUSD {
+			if spec.OnLimitBehavior == models.LimitBehaviorDowngrade && spec.DowngradeModel != nil {
 				result.ShouldDegrade = true
-				result.DowngradeModel = limit.DowngradeModel
+				result.DowngradeModel = spec.DowngradeModel
 				return false, ""
 			}
-			return true, fmt.Sprintf("monthly spend limit exceeded (current: $%.4f, limit: $%.2f)",
-				snap.MonthlySpend, *limit.MonthlySpendLimitUSD)
+			return true, fmt.Sprintf("monthly spend limit exceeded (current: $%.6f, limit: $%.6f)",
+				snap.MonthlySpend, *spec.MonthlySpendLimitUSD)
 		}
-		if snap.MonthlySpend >= *limit.MonthlySpendLimitUSD*0.8 {
-			pct := (snap.MonthlySpend / *limit.MonthlySpendLimitUSD) * 100
+		if snap.MonthlySpend >= *spec.MonthlySpendLimitUSD*0.8 {
+			pct := (snap.MonthlySpend / *spec.MonthlySpendLimitUSD) * 100
 			result.Headers["X-Warning"] = fmt.Sprintf("Customer approaching monthly spend limit (%.0f%%)", pct)
 		}
 	}
@@ -214,7 +226,7 @@ func (l *Limiter) evaluateCostLimits(
 // evaluateRequestLimits applies per-minute/hour/day request caps using a
 // pre-fetched counter snapshot (no Redis calls).
 func (l *Limiter) evaluateRequestLimits(
-	limit *models.CustomerLimit,
+	spec *models.LimitSpec,
 	snap *redisClient.CustomerCounterSnapshot,
 	result *CheckResult,
 ) (blocked bool, reason string) {
@@ -222,33 +234,33 @@ func (l *Limiter) evaluateRequestLimits(
 		return false, ""
 	}
 
-	if limit.RequestsPerMinute != nil {
+	if spec.RequestsPerMinute != nil {
 		result.MinuteRequests = snap.MinuteRequests
-		result.MinuteRequestsLimit = limit.RequestsPerMinute
-		if snap.MinuteRequests >= *limit.RequestsPerMinute {
+		result.MinuteRequestsLimit = spec.RequestsPerMinute
+		if snap.MinuteRequests >= *spec.RequestsPerMinute {
 			return true, fmt.Sprintf("requests per minute limit exceeded (%d/%d)",
-				snap.MinuteRequests, *limit.RequestsPerMinute)
+				snap.MinuteRequests, *spec.RequestsPerMinute)
 		}
 	}
 
-	if limit.RequestsPerHour != nil {
+	if spec.RequestsPerHour != nil {
 		result.HourRequests = snap.HourRequests
-		result.HourRequestsLimit = limit.RequestsPerHour
-		if snap.HourRequests >= *limit.RequestsPerHour {
+		result.HourRequestsLimit = spec.RequestsPerHour
+		if snap.HourRequests >= *spec.RequestsPerHour {
 			return true, fmt.Sprintf("requests per hour limit exceeded (%d/%d)",
-				snap.HourRequests, *limit.RequestsPerHour)
+				snap.HourRequests, *spec.RequestsPerHour)
 		}
 	}
 
-	if limit.RequestsPerDay != nil {
+	if spec.RequestsPerDay != nil {
 		result.DailyRequests = snap.DailyRequests
-		result.DailyRequestsLimit = limit.RequestsPerDay
-		if snap.DailyRequests >= *limit.RequestsPerDay {
+		result.DailyRequestsLimit = spec.RequestsPerDay
+		if snap.DailyRequests >= *spec.RequestsPerDay {
 			return true, fmt.Sprintf("requests per day limit exceeded (%d/%d)",
-				snap.DailyRequests, *limit.RequestsPerDay)
+				snap.DailyRequests, *spec.RequestsPerDay)
 		}
-		if snap.DailyRequests >= int(float64(*limit.RequestsPerDay)*0.8) {
-			pct := (float64(snap.DailyRequests) / float64(*limit.RequestsPerDay)) * 100
+		if snap.DailyRequests >= int(float64(*spec.RequestsPerDay)*0.8) {
+			pct := (float64(snap.DailyRequests) / float64(*spec.RequestsPerDay)) * 100
 			result.Headers["X-Warning"] = fmt.Sprintf("Customer approaching daily request limit (%.0f%%)", pct)
 		}
 	}
@@ -260,10 +272,10 @@ func (l *Limiter) evaluateRequestLimits(
 func (l *Limiter) checkModelLimits(
 	ctx context.Context,
 	req *CheckRequest,
-	limit *models.CustomerLimit,
+	spec *models.LimitSpec,
 	result *CheckResult,
 ) (bool, string, error) {
-	modelLimit, hasLimit := limit.GetModelLimit(req.Model)
+	modelLimit, hasLimit := spec.GetModelLimit(req.Model)
 	if !hasLimit {
 		return false, "", nil // No limit for this model
 	}
@@ -298,12 +310,12 @@ func (l *Limiter) checkModelLimits(
 func (l *Limiter) checkLabelLimits(
 	ctx context.Context,
 	req *CheckRequest,
-	limit *models.CustomerLimit,
+	spec *models.LimitSpec,
 	result *CheckResult,
 ) (bool, string, error) {
 	// Check each label against configured limits
 	for _, labelKey := range req.Labels.ToLabelKeys() {
-		labelLimit, hasLimit := limit.GetLabelLimit(labelKey)
+		labelLimit, hasLimit := spec.GetLabelLimit(labelKey)
 		if !hasLimit {
 			continue
 		}

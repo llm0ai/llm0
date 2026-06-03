@@ -17,6 +17,7 @@ type DB struct {
 	// In-memory hot caches. Kept on the DB struct because they cache the
 	// results of DB reads and must be invalidated by DB writes.
 	limitCache *customerLimitCache
+	tiersCache *customerTiersCache
 }
 
 // NewPostgresDB creates a new PostgreSQL connection
@@ -50,6 +51,7 @@ func NewPostgresDB(cfg *config.Config) (*DB, error) {
 	return &DB{
 		DB:         db,
 		limitCache: newCustomerLimitCache(limitTTL),
+		tiersCache: newCustomerTiersCache(limitTTL),
 	}, nil
 }
 

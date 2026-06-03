@@ -67,11 +67,18 @@ func (v *Validator) ValidateAPIKey(ctx context.Context, apiKey string) (*models.
 // validateFromDatabase looks up and verifies the API key in PostgreSQL
 func (v *Validator) validateFromDatabase(ctx context.Context, apiKey string) (*models.CachedAPIKey, error) {
 	// Query for API key with project info (single query for performance)
+	// We co-select project default_* columns so ResolveCustomerLimit() can
+	// fall back to a project default without an extra query per request.
+	// All default_* columns are nullable (Slice A, plans/customer-limits-tiers.md).
 	query := `
-		SELECT 
+		SELECT
 			ak.id, ak.project_id, ak.key_hash, ak.rate_limit_per_minute, ak.is_active,
-			p.is_active as project_active, p.monthly_cap_usd, 
-			p.cache_enabled, p.semantic_cache_enabled, p.semantic_threshold, p.cache_ttl_seconds
+			p.is_active as project_active, p.monthly_cap_usd,
+			p.cache_enabled, p.semantic_cache_enabled, p.semantic_threshold, p.cache_ttl_seconds,
+			p.default_daily_spend_limit_usd, p.default_monthly_spend_limit_usd,
+			p.default_per_request_max_usd,
+			p.default_requests_per_minute, p.default_requests_per_hour, p.default_requests_per_day,
+			p.default_on_limit_behavior, p.default_downgrade_model
 		FROM api_keys ak
 		INNER JOIN projects p ON ak.project_id = p.id
 		WHERE ak.key_prefix = $1
@@ -96,12 +103,25 @@ func (v *Validator) validateFromDatabase(ctx context.Context, apiKey string) (*m
 		semanticCacheEnabled bool
 		semanticThreshold    float64
 		cacheTTL             int
+
+		// Nullable project default-limit columns (Slice A).
+		defaultDaily      sql.NullFloat64
+		defaultMonthly    sql.NullFloat64
+		defaultPerReq     sql.NullFloat64
+		defaultReqMin     sql.NullInt64
+		defaultReqHour    sql.NullInt64
+		defaultReqDay     sql.NullInt64
+		defaultBehavior   sql.NullString
+		defaultDowngrade  sql.NullString
 	)
 
 	err := v.db.QueryRowContext(ctx, query, prefix).Scan(
 		&keyID, &projectID, &keyHash, &rateLimitPerMinute, &isActive,
 		&projectActive, &monthlyCap, &cacheEnabled, &semanticCacheEnabled,
 		&semanticThreshold, &cacheTTL,
+		&defaultDaily, &defaultMonthly, &defaultPerReq,
+		&defaultReqMin, &defaultReqHour, &defaultReqDay,
+		&defaultBehavior, &defaultDowngrade,
 	)
 
 	if err == sql.ErrNoRows {
@@ -127,8 +147,7 @@ func (v *Validator) validateFromDatabase(ctx context.Context, apiKey string) (*m
 		return nil, fmt.Errorf("project is inactive")
 	}
 
-	// Return cached key info
-	return &models.CachedAPIKey{
+	cached := &models.CachedAPIKey{
 		KeyID:                keyID,
 		ProjectID:            projectID,
 		RateLimitPerMinute:   rateLimitPerMinute,
@@ -140,7 +159,40 @@ func (v *Validator) validateFromDatabase(ctx context.Context, apiKey string) (*m
 		SemanticThreshold:    semanticThreshold,
 		CacheTTL:             cacheTTL,
 		CachedAt:             time.Now(),
-	}, nil
+	}
+	if defaultDaily.Valid {
+		v := defaultDaily.Float64
+		cached.DefaultDailySpendLimitUSD = &v
+	}
+	if defaultMonthly.Valid {
+		v := defaultMonthly.Float64
+		cached.DefaultMonthlySpendLimitUSD = &v
+	}
+	if defaultPerReq.Valid {
+		v := defaultPerReq.Float64
+		cached.DefaultPerRequestMaxUSD = &v
+	}
+	if defaultReqMin.Valid {
+		v := int(defaultReqMin.Int64)
+		cached.DefaultRequestsPerMinute = &v
+	}
+	if defaultReqHour.Valid {
+		v := int(defaultReqHour.Int64)
+		cached.DefaultRequestsPerHour = &v
+	}
+	if defaultReqDay.Valid {
+		v := int(defaultReqDay.Int64)
+		cached.DefaultRequestsPerDay = &v
+	}
+	if defaultBehavior.Valid {
+		v := defaultBehavior.String
+		cached.DefaultOnLimitBehavior = &v
+	}
+	if defaultDowngrade.Valid {
+		v := defaultDowngrade.String
+		cached.DefaultDowngradeModel = &v
+	}
+	return cached, nil
 }
 
 // getFromCache retrieves cached API key from Redis

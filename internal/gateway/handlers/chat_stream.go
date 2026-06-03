@@ -14,6 +14,7 @@ import (
 
 	"github.com/llm0ai/llm0/internal/gateway/auth"
 	"github.com/llm0ai/llm0/internal/gateway/providers"
+	"github.com/llm0ai/llm0/internal/gateway/ratelimit"
 	"github.com/llm0ai/llm0/internal/gateway/streaming"
 	"github.com/llm0ai/llm0/internal/shared/models"
 )
@@ -69,8 +70,13 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Extract customer ID and labels for tracking
+	// Extract customer ID, tier, and labels for tracking.
+	// X-Customer-Tier is an owner-defined slug (e.g. 'free', 'pro') the
+	// project owner attaches to each request. Treated as server-to-server
+	// trust input — never accept from untrusted browser clients. See
+	// plans/customer-limits-tiers.md.
 	customerID := c.GetHeader("X-Customer-ID")
+	customerTier := c.GetHeader("X-Customer-Tier")
 	var customerLabels models.Labels
 	if customerID != "" {
 		customerLabels = make(models.Labels)
@@ -108,7 +114,57 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 		return
 	}
 
-	// Step 2: Check cache (if cache hit, return full response - no streaming)
+	// Step 2: Check per-customer limits (if X-Customer-ID provided).
+	// Mirrors the non-streaming path so streaming requests can't bypass
+	// per-customer spend caps, request limits, and model/label limits.
+	if customerID != "" {
+		estimatedCustomerCost := h.estimateRequestCost(providerName, req.Model, req.Messages, req.MaxTokens)
+
+		customerLimitCheck, cErr := h.customerLimiter.Check(ctx, &ratelimit.CheckRequest{
+			ProjectID:  apiKey.ProjectID,
+			CustomerID: customerID,
+			Model:      req.Model,
+			CostUSD:    estimatedCustomerCost,
+			Labels:     customerLabels,
+			Tier:       customerTier,
+			APIKey:     apiKey,
+		})
+		if cErr != nil {
+			fmt.Printf("⚠️ Customer rate limit check failed: %v (fail-open)\n", cErr)
+		} else if !customerLimitCheck.Allowed {
+			for k, v := range customerLimitCheck.Headers {
+				c.Header(k, v)
+			}
+			c.JSON(429, gin.H{
+				"error":       "customer_rate_limit_exceeded",
+				"message":     customerLimitCheck.Reason,
+				"customer_id": customerID,
+			})
+			return
+		} else if customerLimitCheck != nil {
+			// Surface spend headers + warnings even when allowed.
+			if customerLimitCheck.DailySpendLimit != nil {
+				c.Header("X-Customer-Spend-Today", fmt.Sprintf("%.6f", customerLimitCheck.DailySpend))
+				c.Header("X-Customer-Limit-Daily", fmt.Sprintf("%.6f", *customerLimitCheck.DailySpendLimit))
+				remainingUSD := *customerLimitCheck.DailySpendLimit - customerLimitCheck.DailySpend
+				c.Header("X-Customer-Remaining-Usd", fmt.Sprintf("%.6f", remainingUSD))
+			}
+			for k, v := range customerLimitCheck.Headers {
+				c.Header(k, v)
+			}
+
+			// Apply downgrade if the customer hit a spend cap configured with
+			// on_limit_behavior = "downgrade": route streaming to the cheaper
+			// model. Streaming has no failover chain to rebuild.
+			if newProviderName, ok := h.applyCustomerDowngrade(customerLimitCheck, &req); ok {
+				providerName = newProviderName
+				c.Header("X-Downgraded", "true")
+				c.Header("X-Downgraded-Model", req.Model)
+			}
+		}
+	}
+
+	// Step 3: Check cache (if cache hit, return full response - no streaming)
 	if apiKey.CacheEnabled {
 		cacheKey, err := h.exactCache.CacheKey(apiKey.ProjectID, providerName, req.Model, req.Messages)
 		if err == nil {
@@ -135,13 +191,22 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 		}
 	}
 
-	// Step 3: Check spend cap BEFORE streaming
+	// Step 4: Check project spend cap BEFORE streaming.
+	// Estimate cost from the REAL prompt size + client-supplied max_tokens
+	// (same helper the non-stream path uses) so the streaming project-cap
+	// check matches what the request will actually bill. Previously this
+	// path used a flat 1000-token guess which under-charged short prompts
+	// and over-charged long ones — see plans/cost-control-audit.md P0-3.
 	spendKey := fmt.Sprintf("spend:project:%s:%s", apiKey.ProjectID, time.Now().Format("2006-01"))
-	estimatedTokens := 1000
-	estimatedCost, err := h.costCalculator.EstimateCost(providerName, req.Model, estimatedTokens)
+	promptTokens := estimatePromptTokens(req.Messages)
+	estimatedCost, err := h.costCalculator.EstimateCostForRequest(providerName, req.Model, promptTokens, req.MaxTokens)
 	if err != nil {
 		fmt.Printf("⚠️ Cost estimation failed: %v\n", err)
-		estimatedCost = 0.10
+		if providerName == "ollama" {
+			estimatedCost = 0 // Local models are free
+		} else {
+			estimatedCost = 0.10 // Conservative fallback for unknown cloud models
+		}
 	}
 
 	canAfford, currentSpend, cap, err := h.redis.CheckSpendCap(ctx, spendKey, estimatedCost, apiKey.MonthlyCap)
@@ -157,13 +222,13 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 		return
 	}
 
-	// Step 4: Set SSE headers
+	// Step 5: Set SSE headers
 	streaming.SetSSEHeaders(c)
 	c.Header("X-Cache-Hit", "miss")
 	c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
 	c.Header("X-Provider", providerName)
 
-	// Step 5: Start streaming based on provider
+	// Step 6: Start streaming based on provider
 	type StreamReader interface {
 		Recv() (openai.ChatCompletionStreamResponse, error)
 		Close() error
@@ -198,7 +263,7 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 	}
 	defer stream.Close()
 
-	// Step 6: Stream chunks to client and collect for caching
+	// Step 7: Stream chunks to client and collect for caching
 	collector := streaming.NewStreamCollector(providerName, req.Model)
 	requestID := uuid.New().String()
 
@@ -294,9 +359,9 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 		}
 	}
 
-	// Step 7: Post-stream processing
+	// Step 8: Post-stream processing
 
-	go h.postStreamProcessing(context.Background(), apiKey, providerName, req, collector, requestID, estimatedCost, spendKey, startTime, customerID, customerLabels)
+	go h.postStreamProcessing(context.Background(), apiKey, providerName, req, collector, requestID, estimatedCost, spendKey, startTime, customerID, customerTier, customerLabels)
 
 	fmt.Printf("✅ Streaming request completed in %dms\n", int(time.Since(startTime).Milliseconds()))
 }
@@ -313,6 +378,7 @@ func (h *ChatHandler) postStreamProcessing(
 	spendKey string,
 	startTime time.Time,
 	customerID string,
+	customerTier string,
 	customerLabels models.Labels,
 ) {
 	// Convert collected data to full response
@@ -340,6 +406,23 @@ func (h *ChatHandler) postStreamProcessing(
 		_, _, _, err = h.redis.CheckSpendCap(ctx, spendKey, spendAdjustment, apiKey.MonthlyCap)
 		if err != nil {
 			fmt.Printf("⚠️ Spend adjustment failed: %v\n", err)
+		}
+	}
+
+	// Record per-customer spend + counters (if X-Customer-ID provided) so
+	// streaming requests count toward per-customer daily/monthly caps and
+	// rate limits. Streaming has no failover, so provider/model are final.
+	if customerID != "" {
+		if err := h.customerLimiter.RecordRequest(ctx, &ratelimit.CheckRequest{
+			ProjectID:  apiKey.ProjectID,
+			CustomerID: customerID,
+			Model:      req.Model,
+			CostUSD:    actualCost,
+			Labels:     customerLabels,
+			Tier:       customerTier,
+			APIKey:     apiKey,
+		}); err != nil {
+			fmt.Printf("⚠️ Failed to record customer request (stream): %v\n", err)
 		}
 	}
 

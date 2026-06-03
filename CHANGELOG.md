@@ -113,12 +113,6 @@ full methodology, query, and Linux-vs-macOS comparison.
 
 ## [Unreleased]
 
-### Changed
-
-- **Renamed Go module and repository** from `github.com/mrmushfiq/llm0-gateway`
-  to `github.com/llm0ai/llm0`. Update clone URLs, import paths, and the
-  compiled binary name (`llm0`). Old Go module paths no longer resolve.
-
 ### Planned
 
 - **Scheduler heartbeat table** to close the v0.1.1 paper cut where
@@ -150,6 +144,227 @@ These are loose ideas — promote to **Planned** when confirmed:
 - Switch Redis `maxmemory-policy` from `allkeys-lru` to `noeviction` (or
   a key-prefix-aware alternative) so `spend:*` counters can't be evicted
   under memory pressure.
+- Sub-token-cost USD precision (`DECIMAL(16,8)`) — only relevant for
+  micro-billing scenarios where a single token of `gpt-4o-mini` input
+  (~$0.00000015) needs to be represented exactly. μUSD (6 decimals) is
+  enough for every cap and request cost LLM gateways realistically see.
+
+---
+
+## [0.3.0] — 2026-06-XX
+
+**Spend-firewall expansion.** Per-customer enforcement now works without
+writing a row per end-user: every project carries default caps, owner-defined
+**tiers** (`X-Customer-Tier`) override the defaults, and streaming requests
+are finally subject to the same caps as non-streaming. All USD storage
+widened to **μUSD precision** (`DECIMAL(14,6)`) so sub-cent caps like
+`$0.001/day` are usable. Also folds in the README reframe as "spend
+firewall" positioning and the standalone P0-1/P0-2 quick fix that landed
+between v0.2.0 and this release.
+
+> **One breaking change worth flagging up top:** per-customer rows in the
+> `customer_limits` table are **no longer consulted on the request path**
+> — see [Removed](#removed) below for the one-line migration. The
+> `monthly_cap_usd` project ceiling and every other v0.2.0 setting keep
+> working unchanged.
+
+### Added
+
+- **Project default customer limits** — eight new `default_*` columns on
+  the `projects` table (`default_daily_spend_limit_usd`,
+  `default_monthly_spend_limit_usd`, `default_per_request_max_usd`,
+  `default_requests_per_{minute,hour,day}`, `default_on_limit_behavior`,
+  `default_downgrade_model`). Apply to every end-user in the project
+  without an `INSERT` into `customer_limits`. Managed via the new
+  `scripts/manage_project_defaults.sh` (interactive list/set/clear).
+- **Customer tiers** — new `customer_tiers` table holds owner-defined
+  plans (`free`, `pro`, `enterprise`, any string slug). Customers attach
+  to a tier via the **`X-Customer-Tier`** request header (server-to-server
+  trust input). Tier limits override project defaults. Managed via the
+  new `scripts/manage_tiers.sh` (list/create/update/delete with UPSERT).
+- **Resolver precedence on every request:** tier → project default →
+  unlimited. Unknown tier slugs silently fall through to the default
+  (typo-resistant). See `internal/shared/database/resolver.go` and the
+  new `customer_tiers_cache.go` (~60s in-process TTL). The managed
+  Admin API (M1) will add a per-customer override layer above the tier.
+- **Customer auto-provisioning** — `customer_spend` rows are upserted on
+  the first request carrying a given `X-Customer-ID`. SaaS owners never
+  `INSERT` customers by hand.
+- **`LimitSpec` shared cap type** — single struct embedded in both
+  `CustomerLimit` and `CustomerTier`, so the limiter, resolver, and
+  helpers all speak the same language.
+- **`CachedAPIKey` carries project defaults** — defaults are read at
+  auth time and Redis-cached alongside the API key (no extra hot-path
+  query). The limiter resolves caps in-memory.
+- Unit tests for `LimitSpec`, `CachedAPIKey.ProjectDefaultLimitSpec()`,
+  and `ResolveCustomerLimit` precedence
+  (`internal/shared/models/customer_limits_test.go`,
+  `internal/shared/database/resolver_test.go`).
+- `test_guide/cost-control-slice-a.md` — end-to-end local test guide
+  covering project defaults, tiers, streaming enforcement, downgrade
+  swap, and the μUSD precision floor.
+
+### Changed
+
+- **All USD cap/spend columns widened to `DECIMAL(14,6)` (μUSD
+  precision).** `projects.{monthly_cap_usd,current_month_spend_usd,
+  default_*_usd}`, `customer_limits.*_usd`, `customer_tiers.*_usd`,
+  `gateway_logs.cost_usd`, `customer_spend.total_spend_usd`. Sub-cent
+  caps (down to `$0.000001`) now work — previously anything below
+  `$0.005` rounded to `$0.00`. Helper functions
+  `get_customer_{daily,monthly}_spend` updated to match. Idempotent
+  `ALTER COLUMN … TYPE DECIMAL(14,6)` migration block at the bottom of
+  `schema/schema.sql` widens existing OSS deployments in place
+  (metadata-only on PG 9.2+).
+- **All USD values rendered with `%.6f`** in response headers
+  (`X-Customer-Spend-Today`, `X-Customer-Limit-Daily`,
+  `X-Customer-Remaining-Usd`) and 429 error messages
+  (`"daily spend limit exceeded (current: $X.XXXXXX, limit: $Y.YYYYYY)"`).
+  Previously a mix of `%.2f` / `%.4f`.
+- **Streaming pre-call cost estimate uses real prompt size + `max_tokens`**
+  (`internal/gateway/handlers/chat_stream.go`). Was a flat 1000-token
+  guess regardless of payload size, which mis-estimated tiny prompts by
+  50× and oversized prompts by 100×. The non-streaming path already did
+  this; streaming now matches.
+- **Renamed Go module and repository** from `github.com/mrmushfiq/llm0-gateway`
+  to `github.com/llm0ai/llm0`. Update clone URLs, import paths, and the
+  compiled binary name (`llm0`). Old Go module paths no longer resolve.
+
+### Fixed
+
+- **Streaming endpoint enforces per-customer caps.** Before this
+  release, `"stream": true` requests bypassed the customer limiter
+  entirely — projects with daily caps configured for non-stream were
+  still bleeding money on streamed calls from the same end-user.
+  `chat_stream.go` now calls `customerLimiter.Check`, applies
+  block/downgrade, and writes spend headers before opening the SSE
+  stream. (Internal tracking: **P0-1**.)
+- **`downgrade` behavior actually swaps the model.** The
+  `on_limit_behavior = 'downgrade'` path was wired through the
+  resolver/limiter but the handlers never read
+  `customerLimitCheck.DowngradeModel` — `block` and `downgrade` were
+  effectively the same. Both `chat.go` and `chat_stream.go` now
+  `applyCustomerDowngrade(...)` and rebuild the failover chain around
+  the cheaper model; the response carries `X-Downgraded: true` and
+  `X-Downgraded-Model: <original>`. Tier-level downgrade also works.
+  (Internal tracking: **P0-2**.)
+- **Schema drift on `label_limits` / `spend_by_label`.** Go code read
+  `customer_limits.label_limits` (JSONB, per-label daily caps) and
+  wrote `customer_spend.spend_by_label`, but the columns were missing
+  from `schema.sql`. Both are now declared in the table DDL and
+  re-added by an idempotent `ADD COLUMN IF NOT EXISTS` block.
+
+### Removed
+
+- **Per-customer override path** (`customer_limits` table reads).
+  Sub-commands stripped from `scripts/manage_limits.sh`:
+  `list-customers`, `set-customer-limit`, `delete-customer-limit`.
+  Invoking them now prints a migration message pointing at
+  `manage_tiers.sh` / `manage_project_defaults.sh` and exits non-zero.
+  The other six sub-commands (`list-keys`, `set-key-rate`, `toggle-key`,
+  `list-projects`, `set-project-cap`, `set-project-cache`) are unchanged.
+  Migration:
+  - For "every end-user should be capped at X" → set it once via
+    `./scripts/manage_project_defaults.sh set`.
+  - For "this plan caps at X, that plan caps at Y" →
+    `./scripts/manage_tiers.sh create` (one tier per plan) and pass
+    `X-Customer-Tier: <slug>` per request.
+  - For "this one VIP gets a special cap" → assign that customer a
+    unique tier slug (e.g. `vip-acme`) with its own caps.
+  The `customer_limits` table itself stays in the schema for inspection
+  / read-only audits; it is scheduled for full removal in v0.4.0.
+
+### Deprecated
+
+- **`CUSTOMER_LIMIT_CACHE_TTL_SECONDS`** env var. Was the TTL of the
+  in-process `customer_limits` cache, which is no longer consulted.
+  Reading the value still works (zero behavioral effect) so existing
+  Compose / env files don't break. Will be removed in v0.4.0 alongside
+  the dead Go data-access layer (`internal/shared/database/customer_limits_cache.go`,
+  `GetCustomerLimit` / `UpsertCustomerLimit` / `DeleteCustomerLimit`).
+  Tier and project-default caches are unaffected and have their own
+  TTLs (~60 s in-process for tiers; `CACHE_TTL_SECONDS` for the
+  API-key/project blob in Redis).
+
+### Upgrade notes
+
+The release introduces new tables, new columns, and one type widen.
+Everything is idempotent — re-running `schema.sql` against a v0.1.x
+deployment is safe.
+
+```bash
+git pull
+docker compose build gateway
+
+# Apply additive schema + DECIMAL widen (idempotent, metadata-only)
+docker compose exec -T postgres psql -U llm0 -d llm0_gateway \
+  -f /docker-entrypoint-initdb.d/01_schema.sql
+
+# Rebuild + restart so the new %.6f formatting and resolver land
+docker compose up -d
+docker compose exec -T redis redis-cli FLUSHDB
+```
+
+Notes:
+
+- **Per-customer override is gone** — see the [Removed](#removed) section
+  above. If you had rows in `customer_limits` doing real work in v0.2.0,
+  re-express each one as either (a) a project default if it was the
+  same cap for everyone, (b) a tier (`manage_tiers.sh create`) if you
+  had a small set of plans, or (c) a unique tier slug per VIP. The
+  table rows still exist in Postgres — they're just ignored. Project
+  defaults / tiers are picked up the moment you flush the API-key cache
+  (`docker compose exec -T redis redis-cli FLUSHDB`) or wait out
+  `CACHE_TTL_SECONDS`.
+- **Project-level `monthly_cap_usd` and API-key rate limits are
+  unchanged.** Setting them via `manage_limits.sh set-project-cap` /
+  `set-key-rate` works exactly as in v0.2.0.
+- **Old caps preserved exactly.** A `monthly_cap_usd = $20.00` row stays
+  `$20.00` after the `DECIMAL(14,6)` widen. Only new writes can use sub-cent
+  precision.
+- **`FLUSHDB` is required** to drop the cached `CachedAPIKey` blobs
+  (which carried the old default values). Without it, the gateway keeps
+  serving requests with stale project defaults until the Redis TTL
+  expires (default 1h).
+- **No env vars added** — `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` now also
+  governs the in-process `customer_tiers` cache (same ~60s TTL).
+- **Header format change** — `X-Customer-Limit-Daily` was 2 decimals
+  (`0.01`), now 6 (`0.010000`). Anything parsing these as fixed-width
+  decimals needs adjusting.
+
+---
+
+## [0.2.0] — 2026-05-28
+
+Repository transfer + module path rename. No API surface or schema
+changes — purely an addressability move ahead of the spend-firewall
+reframe.
+
+### Changed
+
+- **Renamed Go module and repository** from
+  `github.com/mrmushfiq/llm0-gateway` to `github.com/llm0ai/llm0`.
+  Update clone URLs, `go.mod` import paths in dependent projects, and
+  the compiled binary name (`llm0`). Old `mrmushfiq/llm0-gateway`
+  module paths no longer resolve via `go get`; existing checkouts keep
+  working until you run `go mod tidy`.
+- **README reframed as a spend firewall** rather than a generic LLM
+  gateway. Headline, feature ordering, and the comparison table now
+  lead with cost containment (the wedge); routing/cache/failover
+  remain documented but as supporting capabilities. No code change.
+
+### Upgrade notes
+
+```bash
+# In any dependent Go project
+go mod edit -replace github.com/mrmushfiq/llm0-gateway=github.com/llm0ai/llm0
+# or, cleaner:
+sed -i 's|mrmushfiq/llm0-gateway|llm0ai/llm0|g' go.mod
+go mod tidy
+```
+
+The Docker Compose / OSS deployment path is unchanged — pull the new
+repo and rebuild, no schema migration.
 
 ---
 
@@ -242,7 +457,9 @@ embedding image are unchanged.
 
 ---
 
-[Unreleased]: https://github.com/llm0ai/llm0/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/llm0ai/llm0/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/llm0ai/llm0/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/llm0ai/llm0/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/llm0ai/llm0/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/llm0ai/llm0/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/llm0ai/llm0/releases/tag/v0.1.1

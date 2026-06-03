@@ -25,9 +25,12 @@ CREATE TABLE IF NOT EXISTS projects (
     user_id UUID NOT NULL,  -- Owner identifier; any UUID you manage
     name    VARCHAR(255) NOT NULL,
 
-    -- Monthly spend cap (gateway blocks requests once exceeded)
-    monthly_cap_usd         DECIMAL(10,2) DEFAULT 20.00,
-    current_month_spend_usd DECIMAL(10,2) DEFAULT 0.00,
+    -- Monthly spend cap (gateway blocks requests once exceeded).
+    -- DECIMAL(14,6) → μUSD precision (matches gateway_logs.cost_usd) so
+    -- caps and accumulated spend can express sub-cent LLM costs without
+    -- rounding loss. Max value: $99,999,999.999999.
+    monthly_cap_usd         DECIMAL(14,6) DEFAULT 20,
+    current_month_spend_usd DECIMAL(14,6) DEFAULT 0,
     spend_reset_at TIMESTAMPTZ DEFAULT date_trunc('month', NOW() + interval '1 month'),
 
     -- Cache settings (can also be set per-request via headers)
@@ -35,6 +38,20 @@ CREATE TABLE IF NOT EXISTS projects (
     semantic_cache_enabled BOOLEAN     DEFAULT false,
     semantic_threshold     DECIMAL(3,2) DEFAULT 0.95, -- cosine similarity threshold
     cache_ttl_seconds      INT         DEFAULT 3600,  -- 1 hour
+
+    -- Per-customer DEFAULT limits (applied to every customer in this project
+    -- unless overridden by a tier or a row in customer_limits). All NULL by
+    -- default — opt-in. Set via scripts/manage_project_defaults.sh or the
+    -- managed-cloud dashboard. See plans/customer-limits-tiers.md.
+    -- DECIMAL(14,6) → μUSD precision, see comment on monthly_cap_usd above.
+    default_daily_spend_limit_usd   DECIMAL(14,6),
+    default_monthly_spend_limit_usd DECIMAL(14,6),
+    default_per_request_max_usd     DECIMAL(14,6),
+    default_requests_per_minute     INT,
+    default_requests_per_hour       INT,
+    default_requests_per_day        INT,
+    default_on_limit_behavior       VARCHAR(20) DEFAULT 'block',
+    default_downgrade_model         VARCHAR(100),
 
     is_active  BOOLEAN     DEFAULT true,
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -88,7 +105,7 @@ CREATE TABLE IF NOT EXISTS gateway_logs (
     tokens_in    INT,
     tokens_out   INT,
     tokens_total INT,
-    cost_usd     DECIMAL(10,6),
+    cost_usd     DECIMAL(14,6),
 
     -- Performance
     latency_ms         INT,
@@ -162,10 +179,10 @@ CREATE TABLE IF NOT EXISTS customer_limits (
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     customer_id VARCHAR(255) NOT NULL,
 
-    -- Spend limits
-    daily_spend_limit_usd   DECIMAL(10,2),
-    monthly_spend_limit_usd DECIMAL(10,2),
-    per_request_max_usd     DECIMAL(10,2),
+    -- Spend limits (DECIMAL(14,6) → μUSD precision)
+    daily_spend_limit_usd   DECIMAL(14,6),
+    monthly_spend_limit_usd DECIMAL(14,6),
+    per_request_max_usd     DECIMAL(14,6),
 
     -- Request limits
     requests_per_minute INT,
@@ -175,6 +192,10 @@ CREATE TABLE IF NOT EXISTS customer_limits (
     -- Per-model limits (JSONB): {"gpt-4o": 50, "gpt-4o-mini": null}
     -- null = unlimited, number = max requests per day for that model
     model_limits JSONB,
+
+    -- Per-label daily request limits (JSONB):
+    -- {"feature:chat": 1000, "team:support": 500}
+    label_limits JSONB,
 
     -- What to do when a limit is hit: 'block' | 'downgrade' | 'warn'
     on_limit_behavior VARCHAR(20) DEFAULT 'block',
@@ -198,10 +219,11 @@ CREATE TABLE IF NOT EXISTS customer_spend (
     date DATE NOT NULL,
     hour INT,  -- 0-23 for hourly, NULL for daily aggregate
 
-    total_spend_usd DECIMAL(10,6) DEFAULT 0,
+    total_spend_usd DECIMAL(14,6) DEFAULT 0,
     request_count   INT           DEFAULT 0,
 
     spend_by_model JSONB DEFAULT '{}'::jsonb,
+    spend_by_label JSONB DEFAULT '{}'::jsonb,
 
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -212,13 +234,58 @@ CREATE TABLE IF NOT EXISTS customer_spend (
 CREATE INDEX IF NOT EXISTS idx_customer_spend_project_customer ON customer_spend(project_id, customer_id, date);
 CREATE INDEX IF NOT EXISTS idx_customer_spend_date             ON customer_spend(date);
 
+-- ============================================================================
+-- CUSTOMER TIERS
+-- Owner-defined "plans" (e.g. 'free', 'pro', 'enterprise' — any slug the
+-- owner picks). Customers carry a tier via the X-Customer-Tier request
+-- header; the limiter resolves the tier's LimitSpec at request time.
+--
+-- Precedence on each request:
+--   X-Customer-Tier (this table) → project default columns → unlimited
+--
+-- LLM0 has no built-in tier names. Managed via scripts/manage_tiers.sh
+-- (OSS) or the managed-cloud dashboard. See plans/customer-limits-tiers.md.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS customer_tiers (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    slug       VARCHAR(64) NOT NULL,    -- owner-defined: 'free', 'pro', '1', etc.
+
+    -- Spend limits (same shape as projects.default_* and customer_limits;
+    -- DECIMAL(14,6) → μUSD precision).
+    daily_spend_limit_usd   DECIMAL(14,6),
+    monthly_spend_limit_usd DECIMAL(14,6),
+    per_request_max_usd     DECIMAL(14,6),
+
+    -- Request limits
+    requests_per_minute INT,
+    requests_per_hour   INT,
+    requests_per_day    INT,
+
+    -- Advanced limits (JSONB)
+    model_limits JSONB,
+    label_limits JSONB,
+
+    -- Behavior on limit: 'block' | 'downgrade' | 'warn'
+    on_limit_behavior VARCHAR(20) DEFAULT 'block',
+    downgrade_model   VARCHAR(100),
+
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE(project_id, slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_customer_tiers_project ON customer_tiers(project_id);
+
 -- Helper: total spend for a customer on a given day
 CREATE OR REPLACE FUNCTION get_customer_daily_spend(
     p_project_id  UUID,
     p_customer_id VARCHAR(255),
     p_date        DATE DEFAULT CURRENT_DATE
-) RETURNS DECIMAL(10,6) LANGUAGE plpgsql AS $$
-DECLARE v_total DECIMAL(10,6);
+) RETURNS DECIMAL(14,6) LANGUAGE plpgsql AS $$
+DECLARE v_total DECIMAL(14,6);
 BEGIN
     SELECT COALESCE(SUM(total_spend_usd), 0)
     INTO v_total
@@ -235,8 +302,8 @@ CREATE OR REPLACE FUNCTION get_customer_monthly_spend(
     p_customer_id VARCHAR(255),
     p_year  INT DEFAULT EXTRACT(YEAR  FROM CURRENT_DATE)::INT,
     p_month INT DEFAULT EXTRACT(MONTH FROM CURRENT_DATE)::INT
-) RETURNS DECIMAL(10,6) LANGUAGE plpgsql AS $$
-DECLARE v_total DECIMAL(10,6);
+) RETURNS DECIMAL(14,6) LANGUAGE plpgsql AS $$
+DECLARE v_total DECIMAL(14,6);
 BEGIN
     SELECT COALESCE(SUM(total_spend_usd), 0)
     INTO v_total
@@ -370,6 +437,73 @@ CREATE INDEX IF NOT EXISTS idx_system_logs_event_time ON system_logs(event_type,
 CREATE INDEX IF NOT EXISTS idx_system_logs_created    ON system_logs(created_at DESC);
 
 -- ============================================================================
+-- UPGRADE PATH FOR EXISTING DATABASES
+-- ----------------------------------------------------------------------------
+-- `CREATE TABLE IF NOT EXISTS` is skipped wholesale when the table already
+-- exists, so columns added to a CREATE TABLE above never reach OSS
+-- deployments that were initialized on an older version. These idempotent
+-- ALTERs reapply column additions safely. All are nullable / constant-default
+-- (PG11+) → metadata-only change, no rewrite, no long locks. Safe on a live
+-- DB. Purely additive; renames/drops/type-changes are not done here.
+-- ============================================================================
+
+-- projects: per-customer default limits (Slice A, plans/customer-limits-tiers.md)
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS default_daily_spend_limit_usd   DECIMAL(14,6),
+    ADD COLUMN IF NOT EXISTS default_monthly_spend_limit_usd DECIMAL(14,6),
+    ADD COLUMN IF NOT EXISTS default_per_request_max_usd     DECIMAL(14,6),
+    ADD COLUMN IF NOT EXISTS default_requests_per_minute     INT,
+    ADD COLUMN IF NOT EXISTS default_requests_per_hour       INT,
+    ADD COLUMN IF NOT EXISTS default_requests_per_day        INT,
+    ADD COLUMN IF NOT EXISTS default_on_limit_behavior       VARCHAR(20) DEFAULT 'block',
+    ADD COLUMN IF NOT EXISTS default_downgrade_model         VARCHAR(100);
+
+-- customer_limits: label_limits column is read by Go but was missing on
+-- older deployments (pre-existing schema drift). Add it idempotently.
+ALTER TABLE customer_limits
+    ADD COLUMN IF NOT EXISTS label_limits JSONB;
+
+-- customer_spend: spend_by_label column is written by Go's RecordCustomerSpend
+-- but was missing on older deployments (pre-existing schema drift).
+ALTER TABLE customer_spend
+    ADD COLUMN IF NOT EXISTS spend_by_label JSONB DEFAULT '{}'::jsonb;
+
+-- ----------------------------------------------------------------------------
+-- USD precision upgrade (μUSD floor)
+-- ----------------------------------------------------------------------------
+-- Older deployments stored cap/spend columns as DECIMAL(10,2), which rounded
+-- any sub-cent value (e.g. $0.000435 of gpt-4o-mini) to $0.00 — limits below
+-- $0.01 were unsettable and `current_month_spend_usd` truncated per-request
+-- accumulation. Widening to DECIMAL(14,6) gives μUSD precision and matches
+-- gateway_logs.cost_usd / customer_spend.total_spend_usd.
+--
+-- ALTER COLUMN TYPE on a NUMERIC widen is a metadata-only change in Postgres
+-- (no table rewrite) as of PG 9.2 when only precision grows and the value
+-- range is preserved. Safe on a live DB. Idempotent — running on an already
+-- DECIMAL(14,6) column is a no-op rewrite-checked-then-skipped by Postgres.
+ALTER TABLE projects
+    ALTER COLUMN monthly_cap_usd                TYPE DECIMAL(14,6),
+    ALTER COLUMN current_month_spend_usd        TYPE DECIMAL(14,6),
+    ALTER COLUMN default_daily_spend_limit_usd  TYPE DECIMAL(14,6),
+    ALTER COLUMN default_monthly_spend_limit_usd TYPE DECIMAL(14,6),
+    ALTER COLUMN default_per_request_max_usd    TYPE DECIMAL(14,6);
+
+ALTER TABLE customer_limits
+    ALTER COLUMN daily_spend_limit_usd   TYPE DECIMAL(14,6),
+    ALTER COLUMN monthly_spend_limit_usd TYPE DECIMAL(14,6),
+    ALTER COLUMN per_request_max_usd     TYPE DECIMAL(14,6);
+
+ALTER TABLE customer_tiers
+    ALTER COLUMN daily_spend_limit_usd   TYPE DECIMAL(14,6),
+    ALTER COLUMN monthly_spend_limit_usd TYPE DECIMAL(14,6),
+    ALTER COLUMN per_request_max_usd     TYPE DECIMAL(14,6);
+
+-- These columns are already DECIMAL(10,6) on fresh installs; widen the
+-- integer side so a single request / day can theoretically exceed $9999.
+ALTER TABLE gateway_logs   ALTER COLUMN cost_usd         TYPE DECIMAL(14,6);
+ALTER TABLE customer_spend ALTER COLUMN total_spend_usd  TYPE DECIMAL(14,6);
+
+-- ============================================================================
 -- AUTO-UPDATE TRIGGER
 -- ============================================================================
 
@@ -391,6 +525,10 @@ EXCEPTION WHEN duplicate_object THEN NULL; END; $$;
 
 DO $$ BEGIN
     CREATE TRIGGER trg_customer_limits_updated_at BEFORE UPDATE ON customer_limits FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+EXCEPTION WHEN duplicate_object THEN NULL; END; $$;
+
+DO $$ BEGIN
+    CREATE TRIGGER trg_customer_tiers_updated_at  BEFORE UPDATE ON customer_tiers  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 EXCEPTION WHEN duplicate_object THEN NULL; END; $$;
 
 DO $$ BEGIN
