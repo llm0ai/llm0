@@ -236,13 +236,14 @@ Response headers included on every call:
 When the limit is exceeded, the gateway returns `429` with a `retry_after` field.
 
 ### Per-Customer Spend Caps
-Pass `X-Customer-ID` on any request to enable per-end-user daily/monthly USD spend caps, daily/monthly/per-request count caps, per-model and per-label caps. The gateway resolves the effective limit on every request via a three-step precedence (first match wins):
+Pass `X-Customer-ID` on any request to enable per-end-user daily/monthly USD spend caps, daily/monthly/per-request count caps, per-model and per-label caps. The gateway resolves the effective limit on every request via a two-step precedence (first match wins):
 
 1. **`X-Customer-Tier`** — owner-defined plan (`free`, `pro`, `enterprise`, anything you name). Defined in the `customer_tiers` table via `./scripts/manage_tiers.sh`.
 2. **Project defaults** — `projects.default_*` columns. One UPDATE applies to every end-user in the project. Set via `./scripts/manage_project_defaults.sh`.
-3. **Per-customer override** — a row in `customer_limits` (legacy / power-user; rarely needed since defaults + tiers cover most cases).
 
 If none of the above resolves to a cap, the customer is unlimited. Customer rows in `customer_spend` are **auto-created on first request** — you never INSERT them by hand.
+
+> The legacy per-customer override row (`customer_limits` table) is no longer consulted on the request path as of v0.3.0. Tiers + project defaults cover every real shape; bespoke per-customer overrides come back via the managed Admin API. See CHANGELOG v0.3.0 "Removed" for the migration.
 
 Both spend caps and request-count caps support three overflow behaviors:
 - `block` — return `429` with spend details and how much longer until reset
@@ -748,7 +749,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env`.
 | `PORT` | `8080` | Gateway listen port |
 | `ENVIRONMENT` | `local` | `local` or `production` (switches Gin to release mode) |
 | `CACHE_TTL_SECONDS` | `3600` | Dual-purpose: (1) default TTL for exact-match cache entries (overridable per project via `projects.cache_ttl_seconds`), and (2) TTL for the Redis `apikey:*` auth cache. Config changes to `monthly_cap_usd`, `rate_limit_per_minute`, or cache flags take up to this long to propagate unless you flush `apikey:*` manually. See `design/enforcement-and-caching.md` |
-| `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` | `60` | TTL for the in-process `customer_limits` cache (per end-user spend/request caps). Changes to the `customer_limits` table propagate within this window, or immediately when updated through the gateway's own data-access layer |
+| `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` | `60` | *(deprecated v0.3.0)* TTL for the legacy `customer_limits` in-process cache. The per-customer override path is no longer consulted; this knob is kept for compatibility and will be removed in v0.4.0. Tier and project-default caches have their own TTLs (~60 s in-process for tiers, `CACHE_TTL_SECONDS` for the API-key/project blob in Redis) |
 | `EMBEDDING_SERVICE_URL` | `""` | Enables semantic caching when set. Docker Compose sets this automatically |
 | `REQUEST_TIMEOUT` | `30s` | Upstream request timeout |
 | `MAX_CONCURRENT_REQUESTS` | `10000` | Concurrency ceiling for the HTTP server |
@@ -911,7 +912,7 @@ Every response includes diagnostic headers:
 | `X-Failover` | `true` if failover occurred |
 | `X-Original-Provider` | Provider that was tried first (on failover) |
 
-When `X-Customer-ID` is sent and a daily/monthly cap resolves for that customer (via tier, project default, or `customer_limits` row), three extra headers are added — pre-call snapshot, useful for client-side backpressure:
+When `X-Customer-ID` is sent and a daily/monthly cap resolves for that customer (via tier or project default), three extra headers are added — pre-call snapshot, useful for client-side backpressure:
 
 | Header | Description |
 |---|---|
@@ -927,13 +928,15 @@ On a `downgrade` cap, the response also carries `X-Downgraded: true` and `X-Down
 
 The gateway has **three independent layers** of usage control, evaluated in order on every request.
 
-> **TL;DR — tune everything via an interactive CLI:**
+> **TL;DR — three small CLIs, one job each:**
 >
 > ```bash
-> ./scripts/manage_limits.sh
+> ./scripts/manage_limits.sh             # API key rates + project monthly cap + cache toggles
+> ./scripts/manage_project_defaults.sh   # default per-customer caps for the whole project
+> ./scripts/manage_tiers.sh              # owner-defined plans (X-Customer-Tier)
 > ```
 >
-> The script wraps `psql` with a menu-driven UI for updating API-key rate limits, project spend caps, cache/semantic settings, and per-customer limits without writing SQL. Changes take effect without a gateway restart.
+> Each wraps `psql` with a menu-driven UI so you don't write SQL by hand. Changes take effect without a gateway restart (per-customer paths flush via the in-process TTL or `docker compose restart gateway`).
 
 ### 1. Per-API-Key Rate Limit (requests/minute)
 A token-bucket algorithm runs atomically in Redis via a Lua script — no race conditions even under thousands of concurrent calls. Each API key has its own `rate_limit_per_minute` stored in the `api_keys` table.
@@ -962,19 +965,17 @@ Each project has a `monthly_cap_usd` column. The gateway **estimates** the reque
 
 ### 3. Per-Customer Spend Limits (recommended path)
 
-A SaaS owner shouldn't have to write a DB row per end-user. The gateway resolves limits with a three-step precedence on every request (first match wins):
+A SaaS owner shouldn't have to write a DB row per end-user. The gateway resolves limits with a two-step precedence on every request (first match wins):
 
 ```
   X-Customer-Tier (customer_tiers row)
       └─ falls through to ─┐
               projects.default_*  (one-time project setup)
                   └─ falls through to ─┐
-                          customer_limits row  (rare / power-user override)
-                              └─ falls through to ─┐
-                                              unlimited
+                                  unlimited
 ```
 
-For most products you set the **project default once** and call it a day. Tiers come in when you want plan-based pricing (`free` / `pro` / `enterprise`). Per-customer overrides exist for edge cases.
+For most products you set the **project default once** and call it a day. Tiers come in when you want plan-based pricing (`free` / `pro` / `enterprise`). Bespoke per-customer overrides return via the managed Admin API; for OSS, a unique tier slug per VIP works as the escape hatch.
 
 **Customer rows are auto-created.** The gateway upserts a `customer_spend` row on the first request carrying a given `X-Customer-ID`. You never `INSERT` into `customer_spend` by hand.
 
@@ -1031,29 +1032,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 Unknown tier slugs silently fall through to the project default (typo-resistant, no error).
 
-#### c) Per-customer override — legacy / edge cases
-
-A row in `customer_limits` overrides both project defaults and tiers. Use for VIPs, special-case unlimited accounts, or hand-tuned bans.
-
-```bash
-./scripts/manage_limits.sh set-customer-limit
-```
-
-Or directly:
-
-```sql
-INSERT INTO customer_limits (
-    project_id, customer_id,
-    daily_spend_limit_usd, monthly_spend_limit_usd,
-    on_limit_behavior, downgrade_model
-) VALUES (
-    '<project-id>', 'user_123',
-    1.00, 20.00,
-    'downgrade', 'gpt-4o-mini'
-);
-```
-
-Per-customer rows are an escape hatch — if you find yourself writing many of them, switch to tiers.
+> **Legacy `customer_limits` table** — through v0.2.0 a per-customer override row could be inserted via `manage_limits.sh set-customer-limit`. That code path was removed in v0.3.0; the table is still in the schema for inspection but the request resolver no longer reads it. Migrate by either (a) raising the matching tier's cap, (b) adjusting the project default, or (c) assigning that VIP a unique tier slug. The Admin API (M1) will restore a first-class per-customer override path.
 
 #### Response headers (any cap path)
 
@@ -1099,8 +1078,11 @@ Because enforcement reads Redis counters directly, Redis restarts without AOF/RD
 # Bump a project's monthly cap (immediately picked up — no gateway restart)
 ./scripts/manage_limits.sh set-project-cap
 
-# Raise a specific customer's daily or monthly limit
-./scripts/manage_limits.sh set-customer-limit
+# Raise the daily / monthly cap for an entire tier (all customers on it)
+./scripts/manage_tiers.sh update
+
+# Raise the project's per-customer default (applies to every end-user)
+./scripts/manage_project_defaults.sh set
 
 # Nuclear option: zero out the Redis counter for a project mid-month
 docker compose exec redis redis-cli DEL "spend:project:<project_id>:$(date -u +%Y-%m)"
@@ -1145,7 +1127,7 @@ The gateway tracks cost in two places: **before** the call (for spend-cap enforc
 
 **1. Pricing source** — the `model_pricing` table, one row per `(provider, model)` pair with `input_per_1k_tokens` and `output_per_1k_tokens` (`DECIMAL(10,8)` — 10nUSD precision). Pricing is loaded into memory at startup — restart the gateway after updates via `./scripts/manage_models.sh`.
 
-**Storage precision** — `gateway_logs.cost_usd`, `customer_spend.total_spend_usd`, and every USD cap column (`projects.monthly_cap_usd`, `projects.default_*_usd`, `customer_limits.*_usd`, `customer_tiers.*_usd`) are all `DECIMAL(14,6)` — μUSD precision. A single `gpt-4o-mini` token costs ~$0.00000015, so 6 decimals is enough to represent any realistic cap or request cost without rounding loss. Caps and headers are rendered with `%.6f` end-to-end.
+**Storage precision** — `gateway_logs.cost_usd`, `customer_spend.total_spend_usd`, and every USD cap column (`projects.monthly_cap_usd`, `projects.default_*_usd`, `customer_tiers.*_usd`) are all `DECIMAL(14,6)` — μUSD precision. A single `gpt-4o-mini` token costs ~$0.00000015, so 6 decimals is enough to represent any realistic cap or request cost without rounding loss. Caps and headers are rendered with `%.6f` end-to-end. The legacy `customer_limits.*_usd` columns are also `DECIMAL(14,6)` but are no longer read on the request path (see v0.3.0 "Removed").
 
 **2. Cost formula** — applied identically in every path:
 

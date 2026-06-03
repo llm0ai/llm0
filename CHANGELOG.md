@@ -160,8 +160,13 @@ are finally subject to the same caps as non-streaming. All USD storage
 widened to **μUSD precision** (`DECIMAL(14,6)`) so sub-cent caps like
 `$0.001/day` are usable. Also folds in the README reframe as "spend
 firewall" positioning and the standalone P0-1/P0-2 quick fix that landed
-between v0.2.0 and this release. Backwards-compatible: existing
-`customer_limits` rows and `monthly_cap_usd` keep working unchanged.
+between v0.2.0 and this release.
+
+> **One breaking change worth flagging up top:** per-customer rows in the
+> `customer_limits` table are **no longer consulted on the request path**
+> — see [Removed](#removed) below for the one-line migration. The
+> `monthly_cap_usd` project ceiling and every other v0.2.0 setting keep
+> working unchanged.
 
 ### Added
 
@@ -178,10 +183,10 @@ between v0.2.0 and this release. Backwards-compatible: existing
   trust input). Tier limits override project defaults. Managed via the
   new `scripts/manage_tiers.sh` (list/create/update/delete with UPSERT).
 - **Resolver precedence on every request:** tier → project default →
-  per-customer override → unlimited. Unknown tier slugs silently fall
-  through to the default (typo-resistant). See
-  `internal/shared/database/resolver.go` and the new
-  `customer_tiers_cache.go` (~60s in-process TTL).
+  unlimited. Unknown tier slugs silently fall through to the default
+  (typo-resistant). See `internal/shared/database/resolver.go` and the
+  new `customer_tiers_cache.go` (~60s in-process TTL). The managed
+  Admin API (M1) will add a per-customer override layer above the tier.
 - **Customer auto-provisioning** — `customer_spend` rows are upserted on
   the first request carrying a given `X-Customer-ID`. SaaS owners never
   `INSERT` customers by hand.
@@ -249,6 +254,38 @@ between v0.2.0 and this release. Backwards-compatible: existing
   from `schema.sql`. Both are now declared in the table DDL and
   re-added by an idempotent `ADD COLUMN IF NOT EXISTS` block.
 
+### Removed
+
+- **Per-customer override path** (`customer_limits` table reads).
+  Sub-commands stripped from `scripts/manage_limits.sh`:
+  `list-customers`, `set-customer-limit`, `delete-customer-limit`.
+  Invoking them now prints a migration message pointing at
+  `manage_tiers.sh` / `manage_project_defaults.sh` and exits non-zero.
+  The other six sub-commands (`list-keys`, `set-key-rate`, `toggle-key`,
+  `list-projects`, `set-project-cap`, `set-project-cache`) are unchanged.
+  Migration:
+  - For "every end-user should be capped at X" → set it once via
+    `./scripts/manage_project_defaults.sh set`.
+  - For "this plan caps at X, that plan caps at Y" →
+    `./scripts/manage_tiers.sh create` (one tier per plan) and pass
+    `X-Customer-Tier: <slug>` per request.
+  - For "this one VIP gets a special cap" → assign that customer a
+    unique tier slug (e.g. `vip-acme`) with its own caps.
+  The `customer_limits` table itself stays in the schema for inspection
+  / read-only audits; it is scheduled for full removal in v0.4.0.
+
+### Deprecated
+
+- **`CUSTOMER_LIMIT_CACHE_TTL_SECONDS`** env var. Was the TTL of the
+  in-process `customer_limits` cache, which is no longer consulted.
+  Reading the value still works (zero behavioral effect) so existing
+  Compose / env files don't break. Will be removed in v0.4.0 alongside
+  the dead Go data-access layer (`internal/shared/database/customer_limits_cache.go`,
+  `GetCustomerLimit` / `UpsertCustomerLimit` / `DeleteCustomerLimit`).
+  Tier and project-default caches are unaffected and have their own
+  TTLs (~60 s in-process for tiers; `CACHE_TTL_SECONDS` for the
+  API-key/project blob in Redis).
+
 ### Upgrade notes
 
 The release introduces new tables, new columns, and one type widen.
@@ -270,10 +307,18 @@ docker compose exec -T redis redis-cli FLUSHDB
 
 Notes:
 
-- **Cap behavior is unchanged for existing setups.** If you've already
-  configured per-customer rows in `customer_limits`, they keep working —
-  the resolver only looks at tier / project default when no per-customer
-  row exists.
+- **Per-customer override is gone** — see the [Removed](#removed) section
+  above. If you had rows in `customer_limits` doing real work in v0.2.0,
+  re-express each one as either (a) a project default if it was the
+  same cap for everyone, (b) a tier (`manage_tiers.sh create`) if you
+  had a small set of plans, or (c) a unique tier slug per VIP. The
+  table rows still exist in Postgres — they're just ignored. Project
+  defaults / tiers are picked up the moment you flush the API-key cache
+  (`docker compose exec -T redis redis-cli FLUSHDB`) or wait out
+  `CACHE_TTL_SECONDS`.
+- **Project-level `monthly_cap_usd` and API-key rate limits are
+  unchanged.** Setting them via `manage_limits.sh set-project-cap` /
+  `set-key-rate` works exactly as in v0.2.0.
 - **Old caps preserved exactly.** A `monthly_cap_usd = $20.00` row stays
   `$20.00` after the `DECIMAL(14,6)` widen. Only new writes can use sub-cent
   precision.
