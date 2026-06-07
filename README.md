@@ -277,7 +277,7 @@ Every run writes an audit row to `system_logs` (when it does work). Disable all 
 
 ## Supported Models
 
-Pricing ships pre-seeded in [`schema/seed_models.sql`](schema/seed_models.sql) and can be extended at runtime via [`scripts/manage_models.sh`](scripts/manage_models.sql) — no code changes or redeploy required. New models from any cloud provider are auto-routable as soon as they're added to the pricing table (see [Dynamic Model Routing](#managing-model-pricing)).
+Pricing ships pre-seeded in [`schema/seed_models.sql`](schema/seed_models.sql) and can be extended at runtime via [`scripts/manage_models.sh`](scripts/manage_models.sh) or bulk-refreshed with [`scripts/sync_pricing.sh`](scripts/sync_pricing.sh) — no code changes or redeploy required. New models from any cloud provider are auto-routable as soon as they're added to the pricing table (see [Managing Model Pricing](#managing-model-pricing)).
 
 ### OpenAI
 | Model | Tier | Context | Input $/1K | Output $/1K |
@@ -358,7 +358,7 @@ docker compose build
 docker compose up
 ```
 
-Postgres (with `pgvector`), Redis, the embedding service, and the gateway all start together. The database schema is applied automatically on first boot.
+Postgres (with `pgvector`), Redis, the embedding service, and the gateway all start together. The database schema and default model pricing (`seed_models.sql`) are applied automatically on first boot — no extra setup step. To refresh prices later, run `./scripts/sync_pricing.sh --apply` (see [Managing Model Pricing](#managing-model-pricing)).
 
 > **Don't want the ~3 GB embedding service?** Start just the three core containers instead:
 >
@@ -656,18 +656,86 @@ docker compose restart gateway
 
 Prices are specified per 1,000 tokens in USD (e.g. `gpt-4o-mini` input is `0.00015`). Ollama models can be added with `0.00000000` prices to make their cost explicit in request logs.
 
-### Keeping pricing current
+### Bulk refresh with `sync_pricing.sh`
 
-Provider pricing drifts — new models launch, old ones get cheaper, and context windows change. Here's the policy:
+For OpenAI, Anthropic, and **Google AI Studio** (not Vertex AI), use the bundled sync script to pull current model prices from [LiteLLM's community JSON](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json). No provider exposes a pricing API — this is the same upstream dataset the OSS gateway ecosystem uses.
+
+**Requires:** `jq`, `curl`. For `--apply`, Postgres must be running (`docker compose up -d postgres`).
+
+```bash
+# 1. Preview what would change (safe — no writes)
+./scripts/sync_pricing.sh
+
+# 2. Apply to your running database
+./scripts/sync_pricing.sh --apply
+docker compose restart gateway
+
+# 3. Optional: regenerate schema/seed_models.sql for fresh installs / PRs
+./scripts/sync_pricing.sh --write-seed
+git diff schema/seed_models.sql
+```
+
+**Other flags:**
+
+```bash
+./scripts/sync_pricing.sh --providers=openai,google     # subset of providers
+./scripts/sync_pricing.sh --include-deprecated          # include past deprecation_date
+./scripts/sync_pricing.sh --json-file=./pricing.json    # offline / pinned input
+./scripts/sync_pricing.sh --apply --write-seed          # update DB + seed file
+```
+
+The script shows four diff sections: **NEW MODELS**, **PRICE CHANGES**, **UNCHANGED**, and **DB-ONLY** (rows you added manually — e.g. `ollama` — are never deleted). `--apply` UPSERTs OpenAI / Anthropic / Google entries; `--write-seed` rewrites the seed file with `ON CONFLICT DO NOTHING` (safe for first boot).
+
+### Setup: seed vs sync — which to use when
+
+| When | What to run | Why |
+|---|---|---|
+| **First install** (`docker compose up`) | Nothing — `seed_models.sql` runs automatically | Deterministic, no network, works offline |
+| **Upgraded install, want latest prices** | `./scripts/sync_pricing.sh --apply` | Updates `model_pricing` in place without re-seeding |
+| **One-off model or price tweak** | `./scripts/manage_models.sh add` / `update` | Surgical edit for a single row |
+| **Maintainer: ship updated defaults** | `./scripts/sync_pricing.sh --write-seed` → commit PR | Next `git pull` gives everyone a fresher seed |
+
+The seed is the **baseline for new installs**. The sync script is the **optional refresh** for running environments. You don't replace one with the other.
+
+### Model availability and deprecation
+
+**Pricing in `model_pricing` does not guarantee the model still works with your API key.** Providers retire models, change regional access, and gate models by billing tier. A row in the table only means "we know what it *should* cost" — not "your key can call it today."
+
+Signs a model is unavailable:
+
+- Response headers show **`X-Failover: true`** and **`X-Original-Provider: google`** (or `anthropic` / `openai`) while **`X-Provider`** is a different provider — the gateway tried your requested model, it failed, and automatic failover routed to the next provider in the chain.
+- Gateway logs: `Google failed (...), trying next provider...`
+
+`sync_pricing.sh` skips models past LiteLLM's `deprecation_date` by default. That filters known-retired entries from the pricing file — it does **not** probe whether your key can reach a model right now. If `gemini-2.0-flash` fails but `gemini-2.5-flash` works, use the model that responds; remove dead entries with `./scripts/manage_models.sh delete` if you want failover to stop trying them.
+
+To disable failover for debugging (see the raw provider error):
+
+```bash
+# In .env — only try the provider that matches the model prefix
+FAILOVER_MODE=cloud_only   # default chain; set cloud_only and use a model you know works
+```
+
+Or call the provider directly to verify before blaming the gateway:
+
+```bash
+# Google AI Studio — replace MODEL and KEY
+curl "https://generativelanguage.googleapis.com/v1beta/models/MODEL:generateContent?key=$GEMINI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}'
+```
+
+### Keeping pricing current — quick reference
 
 | Situation | What to do |
 |---|---|
-| New model released upstream | Add it with `./scripts/manage_models.sh add` — no code change needed. Cloud providers are routed by prefix (`gpt-*`, `claude-*`, `gemini-*`), so new models work immediately. |
-| Want the fix to persist across fresh installs | Submit a PR updating [`schema/seed_models.sql`](schema/seed_models.sql). That single file is the canonical source of truth. |
-| Pricing changed on an existing model | `./scripts/manage_models.sh update` locally; PR the seed file for the upstream fix. |
-| Running a fleet of gateways | Roll out the updated `seed_models.sql` and apply it once per database (`psql ... -f seed_models.sql`). It's idempotent, so re-running is safe. |
+| Fresh install | Nothing — seed runs on first Postgres boot |
+| Want latest OpenAI / Anthropic / Google prices | `./scripts/sync_pricing.sh` → review diff → `--apply` |
+| One new model or custom price | `./scripts/manage_models.sh add` or `update` |
+| Ship updated defaults upstream | `./scripts/sync_pricing.sh --write-seed` → PR `seed_models.sql` |
+| Model retired / unreachable | `./scripts/manage_models.sh delete` (or ignore — failover handles it) |
+| Fleet of gateways | `sync_pricing.sh --apply` once per database, then restart each gateway |
 
-We intentionally **do not** auto-scrape provider pricing pages: those pages are unstable, ToS-ambiguous, and silently reformat. Community-reviewed PRs against `seed_models.sql` are the safest long-term update channel — the same approach LiteLLM uses.
+We do **not** scrape provider HTML pricing pages at runtime (unstable, ToS-ambiguous). `sync_pricing.sh` pulls a pinned community JSON at sync time — you review the diff before applying.
 
 ---
 
