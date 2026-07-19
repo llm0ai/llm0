@@ -18,22 +18,25 @@ func NewLogger(db *database.DB) *Logger {
 	return &Logger{db: db}
 }
 
-// LogFailover logs a failover event to the database
-func (l *Logger) LogFailover(ctx context.Context, projectID uuid.UUID, requestID string, result *FailoverResult) error {
+// LogFailover logs a failover event to the database. Takes the raw
+// occurred flag + attempt log rather than *FailoverResult so it works for
+// both the non-streaming (FailoverResult) and streaming (StreamFailoverResult)
+// paths, which share the same Attempts shape but aren't the same struct.
+func (l *Logger) LogFailover(ctx context.Context, projectID uuid.UUID, requestID string, failoverOccurred bool, attempts []FailoverAttempt) error {
 	// Only log if failover actually occurred and we have multiple attempts
-	if !result.FailoverOccurred || len(result.Attempts) < 2 {
+	if !failoverOccurred || len(attempts) < 2 {
 		return nil
 	}
 
 	// Find the original failed attempt and the successful fallback
 	var originalAttempt, fallbackAttempt *FailoverAttempt
 
-	for i := range result.Attempts {
+	for i := range attempts {
 		if i == 0 {
-			originalAttempt = &result.Attempts[i]
+			originalAttempt = &attempts[i]
 		}
-		if result.Attempts[i].Success {
-			fallbackAttempt = &result.Attempts[i]
+		if attempts[i].Success {
+			fallbackAttempt = &attempts[i]
 			break
 		}
 	}
@@ -44,8 +47,8 @@ func (l *Logger) LogFailover(ctx context.Context, projectID uuid.UUID, requestID
 	}
 
 	// If no successful fallback, use the last attempt
-	if fallbackAttempt == nil && len(result.Attempts) > 1 {
-		fallbackAttempt = &result.Attempts[len(result.Attempts)-1]
+	if fallbackAttempt == nil && len(attempts) > 1 {
+		fallbackAttempt = &attempts[len(attempts)-1]
 	}
 
 	// If still no fallback, can't log
@@ -55,7 +58,7 @@ func (l *Logger) LogFailover(ctx context.Context, projectID uuid.UUID, requestID
 
 	// Calculate total latency from all attempts
 	totalLatency := 0
-	for _, attempt := range result.Attempts {
+	for _, attempt := range attempts {
 		totalLatency += attempt.LatencyMs
 	}
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/llm0ai/llm0/internal/gateway/providers"
+	"github.com/sashabaranov/go-openai"
 )
 
 // Executor handles failover logic for LLM requests
@@ -192,6 +193,200 @@ func (e *Executor) attemptRequest(
 	attempt.Success = true
 	attempt.Response = resp
 	return attempt
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Streaming failover — pre-first-byte only.
+//
+// Non-streaming failover (Execute, above) can freely retry: nothing has been
+// sent to the client until a full response is ready. Streaming can't do
+// that once bytes are flowing — a mid-stream retry would either double-bill
+// the caller or splice two providers' output into one response. Every other
+// gateway (LiteLLM's FallbackStreamWrapper, Portkey, OpenRouter) draws the
+// same line: failover is safe up to the first byte, and never after.
+//
+// ExecuteStream implements exactly that: each step's stream is opened AND
+// its first chunk received before we commit to it, reusing the same
+// classifyError/isRetriableError matrix as Execute. The moment a step
+// yields a first chunk, failover is over — the caller owns the stream from
+// there and any later failure is a mid-stream error, not a retry.
+// ─────────────────────────────────────────────────────────────────────────
+
+// StreamReader is the minimal surface every provider's streaming response
+// type exposes (the OpenAI SDK's *ChatCompletionStream, and each provider's
+// bespoke wrapper around it). Defined here rather than in providers so both
+// the executor and the HTTP handler can depend on it without a cycle.
+type StreamReader interface {
+	Recv() (openai.ChatCompletionStreamResponse, error)
+	Close() error
+}
+
+// StreamOpener opens a live stream for one (provider, model) chain step.
+// Returning an error — bad key, unknown model, connection failure, or a
+// stream that ends before yielding anything — is exactly the "pre-first-byte
+// failure" ExecuteStream retries past.
+//
+// Deliberately takes no extra timeout: it's handed the caller's own request
+// context (no artificial deadline), matching the non-streaming path's
+// reliance on ctx cancellation/client-disconnect rather than a fixed budget
+// per attempt. A hard per-attempt deadline here would also cap the usable
+// lifetime of a *successful* long-running stream (e.g. Ollama on CPU),
+// which is wrong — only the wait for the first byte needs bounding, and in
+// practice that's already bounded by the provider's own connect/response
+// timeout under the hood.
+type StreamOpener func(ctx context.Context, step FailoverStep, req providers.ChatRequest) (StreamReader, error)
+
+// StreamFailoverResult mirrors FailoverResult for the streaming path: a
+// live, already-primed Stream + its FirstChunk stand in for the full
+// ChatResponse Execute() would return.
+type StreamFailoverResult struct {
+	Success bool
+
+	// Stream is the live, already-primed reader for the winning step.
+	// nil when Success is false.
+	Stream     StreamReader
+	FirstChunk openai.ChatCompletionStreamResponse
+
+	Error error
+
+	OriginalModel    string
+	FinalModel       string
+	OriginalProvider string
+	FinalProvider    string
+	FailoverOccurred bool
+	AttemptsCount    int
+	TotalLatencyMs   int
+
+	Attempts []FailoverAttempt
+}
+
+// ExecuteStream is the streaming counterpart to Execute — see the package
+// doc comment above for the safety argument. `open` is called once per
+// chain step; a step "succeeds" only once open() returns AND its first
+// Recv() yields a chunk.
+func (e *Executor) ExecuteStream(
+	ctx context.Context,
+	req providers.ChatRequest,
+	chain *FailoverChain,
+	open StreamOpener,
+) *StreamFailoverResult {
+	startTime := time.Now()
+
+	result := &StreamFailoverResult{
+		OriginalModel: req.Model,
+		Attempts:      []FailoverAttempt{},
+	}
+
+	steps := []FailoverStep{}
+	if chain != nil {
+		steps = chain.Steps
+	}
+
+	if len(steps) == 0 {
+		providerName := e.detectProviderForModel(req.Model)
+		if providerName == "" {
+			result.Error = fmt.Errorf("no provider found for model: %s", req.Model)
+			return result
+		}
+		steps = []FailoverStep{
+			{Provider: providerName, Model: req.Model, ProviderName: providerName},
+		}
+	}
+
+	if len(steps) > e.maxAttempts {
+		steps = steps[:e.maxAttempts]
+	}
+
+	for i, step := range steps {
+		if i == 0 {
+			result.OriginalProvider = step.Provider
+		}
+
+		attempt := e.attemptStream(ctx, step, req, open)
+		result.Attempts = append(result.Attempts, attempt.log)
+		result.AttemptsCount++
+
+		if attempt.success {
+			result.Success = true
+			result.Stream = attempt.stream
+			result.FirstChunk = attempt.firstChunk
+			result.FinalModel = step.Model
+			result.FinalProvider = step.Provider
+			result.FailoverOccurred = i > 0
+			result.TotalLatencyMs = int(time.Since(startTime).Milliseconds())
+			return result
+		}
+
+		if !e.isRetriableError(attempt.log) {
+			result.Error = attempt.log.Error
+			result.FinalProvider = step.Provider
+			result.FinalModel = step.Model
+			result.TotalLatencyMs = int(time.Since(startTime).Milliseconds())
+			return result
+		}
+
+		fmt.Printf("⚠️  %s failed pre-first-byte (%s), trying next provider...\n",
+			step.ProviderName, attempt.log.TriggerReason)
+	}
+
+	lastAttempt := result.Attempts[len(result.Attempts)-1]
+	result.Error = fmt.Errorf("all providers failed: %w", lastAttempt.Error)
+	result.FinalProvider = lastAttempt.Provider
+	result.FinalModel = lastAttempt.Model
+	result.TotalLatencyMs = int(time.Since(startTime).Milliseconds())
+
+	return result
+}
+
+// streamAttempt is attemptStream's result — the streaming analogue of
+// attemptRequest's plain FailoverAttempt, plus the live stream + first
+// chunk on success (which don't fit in FailoverAttempt's log-only shape).
+type streamAttempt struct {
+	success    bool
+	stream     StreamReader
+	firstChunk openai.ChatCompletionStreamResponse
+	log        FailoverAttempt
+}
+
+// attemptStream opens one chain step's stream and primes it (waits for the
+// first chunk). On any failure it closes the stream (if one was opened) so
+// a step that opens successfully but fails on the first Recv doesn't leak
+// the underlying connection.
+func (e *Executor) attemptStream(
+	ctx context.Context,
+	step FailoverStep,
+	req providers.ChatRequest,
+	open StreamOpener,
+) streamAttempt {
+	startTime := time.Now()
+	log := FailoverAttempt{
+		Provider:  step.Provider,
+		Model:     step.Model,
+		StartTime: startTime,
+	}
+
+	stream, err := open(ctx, step, req)
+	var firstChunk openai.ChatCompletionStreamResponse
+	if err == nil {
+		firstChunk, err = stream.Recv()
+		if err != nil {
+			stream.Close()
+		}
+	}
+
+	log.LatencyMs = int(time.Since(startTime).Milliseconds())
+
+	if err != nil {
+		log.Success = false
+		log.Error = err
+		log.ErrorMessage = err.Error()
+		log.TriggerReason = e.classifyError(err, ctx)
+		log.StatusCode = e.extractStatusCode(err)
+		return streamAttempt{success: false, log: log}
+	}
+
+	log.Success = true
+	return streamAttempt{success: true, stream: stream, firstChunk: firstChunk, log: log}
 }
 
 // classifyError determines the type of error for failover decision

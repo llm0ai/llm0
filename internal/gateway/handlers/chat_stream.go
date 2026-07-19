@@ -10,16 +10,59 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/sashabaranov/go-openai"
 
 	"github.com/llm0ai/llm0/internal/gateway/auth"
+	"github.com/llm0ai/llm0/internal/gateway/failover"
 	"github.com/llm0ai/llm0/internal/gateway/providers"
 	"github.com/llm0ai/llm0/internal/gateway/ratelimit"
 	"github.com/llm0ai/llm0/internal/gateway/streaming"
 	"github.com/llm0ai/llm0/internal/shared/models"
 )
 
-// ChatCompletionsStream handles streaming chat completion requests
+// openProviderStream opens a live stream for one (provider, model) attempt.
+// Used directly for the non-failover case and as the failover.StreamOpener
+// callback for GetFailoverChain-driven attempts — see ExecuteStream in
+// internal/gateway/failover/executor.go for how errors returned here are
+// turned into pre-first-byte failover.
+func (h *ChatHandler) openProviderStream(ctx context.Context, providerName string, req providers.ChatRequest) (failover.StreamReader, error) {
+	switch providerName {
+	case "openai":
+		return h.openaiProvider.ChatCompletionStream(ctx, req)
+	case "anthropic":
+		return h.anthropicProvider.ChatCompletionStream(ctx, req)
+	case "google":
+		return h.geminiProvider.ChatCompletionStream(ctx, req)
+	case "ollama":
+		if h.ollamaProvider == nil {
+			return nil, fmt.Errorf("ollama not configured (set OLLAMA_BASE_URL)")
+		}
+		return h.ollamaProvider.ChatCompletionStream(ctx, req)
+	default:
+		return nil, fmt.Errorf("streaming not supported for provider %s", providerName)
+	}
+}
+
+// ChatCompletionsStream handles streaming chat completion requests.
+//
+// Failover — pre-first-byte only. This used to be disabled entirely for
+// streaming ("can't retry mid-stream"), which is true, but incomplete: a
+// step can fail before it ever sends a byte (bad key, unknown model,
+// connection error), and that failure is completely invisible to the
+// client if we haven't committed to SSE yet. Every other gateway agrees on
+// this line (LiteLLM's FallbackStreamWrapper, Portkey, OpenRouter): retry
+// freely before the first byte, never after. See failover.Executor.ExecuteStream
+// for the mechanics — same retry/skip/stop matrix as the non-streaming path.
+//
+//   - Steps 1-6 below (rate limit, customer limits + downgrade, cache,
+//     project cap) run before any provider call, exactly like the
+//     non-streaming path — a rejection here is still a plain JSON response.
+//   - Step 7 primes every step in the failover chain (opens the stream AND
+//     waits for its first chunk) before sending any SSE header. A total
+//     failure at this point is a plain JSON error response (400/500), not
+//     an SSE frame — nothing has been written to the client yet.
+//   - Step 8 commits: SSE headers go out, the already-consumed first chunk
+//     is forwarded, and failover is over for this request. Every failure
+//     past this point is an SSE error frame, never a retry.
 func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 	startTime := time.Now()
 
@@ -155,7 +198,8 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 
 			// Apply downgrade if the customer hit a spend cap configured with
 			// on_limit_behavior = "downgrade": route streaming to the cheaper
-			// model. Streaming has no failover chain to rebuild.
+			// model. The failover chain built in step 7 is rebuilt off the
+			// (possibly downgraded) req.Model, so this stays correct.
 			if newProviderName, ok := h.applyCustomerDowngrade(customerLimitCheck, &req); ok {
 				providerName = newProviderName
 				c.Header("X-Downgraded", "true")
@@ -186,6 +230,8 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 				c.Header("X-Tokens-Total", fmt.Sprintf("%d", cachedResponse.Usage.TotalTokens))
 				c.Header("X-Provider", providerName)
 				c.JSON(200, cachedResponse)
+
+				go h.logRequest(context.Background(), apiKey, providerName, req, cachedResponse, true, false, 0, false, 0, "", customerID, customerLabels)
 				return
 			}
 		}
@@ -222,50 +268,63 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 		return
 	}
 
-	// Step 5: Set SSE headers
+	// Step 5: Get failover chain for this model.
+	// Chain composition respects FAILOVER_MODE (cloud_first / local_first /
+	// local_only / cloud_only) — identical to the non-streaming path.
+	chain := failover.GetFailoverChain(req.Model, h.cfg)
+	if chain != nil {
+		fmt.Printf("🔄 Streaming failover enabled (pre-first-byte only): %d providers in chain\n", len(chain.Steps))
+	}
+
+	// Step 6: Prime the chain — open each step's stream and wait for its
+	// first chunk before sending any SSE header. See failover.ExecuteStream.
+	requestID := uuid.New().String()
+	opener := func(attemptCtx context.Context, step failover.FailoverStep, attemptReq providers.ChatRequest) (failover.StreamReader, error) {
+		attemptReq.Model = step.Model
+		return h.openProviderStream(attemptCtx, step.Provider, attemptReq)
+	}
+	streamResult := h.failoverExecutor.ExecuteStream(ctx, req, chain, opener)
+
+	if !streamResult.Success {
+		// Nothing has been written to the client yet — a plain JSON error,
+		// same status codes the non-streaming path would use.
+		fmt.Printf("❌ Streaming failed before first byte (all chain steps failed): %v\n", streamResult.Error)
+		c.JSON(500, gin.H{
+			"error":   "provider_error",
+			"message": streamResult.Error.Error(),
+		})
+		go h.logRequest(context.Background(), apiKey, streamResult.FinalProvider, req, nil, false, false, 0, streamResult.FailoverOccurred, streamResult.AttemptsCount-1, requestID, customerID, customerLabels)
+		return
+	}
+
+	finalProviderName := streamResult.FinalProvider
+	finalModel := streamResult.FinalModel
+	stream := streamResult.Stream
+	defer stream.Close()
+
+	if streamResult.FailoverOccurred {
+		fmt.Printf("✅ Streaming failover succeeded: %s/%s -> %s/%s\n",
+			streamResult.OriginalProvider, streamResult.OriginalModel, finalProviderName, finalModel)
+		go h.failoverLogger.LogFailover(context.Background(), apiKey.ProjectID, requestID, streamResult.FailoverOccurred, streamResult.Attempts)
+	}
+
+	// Step 7: Commit to SSE. Every response from this point on is a
+	// `data: ` frame, including errors — failover is over; see file header.
 	streaming.SetSSEHeaders(c)
 	c.Header("X-Cache-Hit", "miss")
 	c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
-	c.Header("X-Provider", providerName)
-
-	// Step 6: Start streaming based on provider
-	type StreamReader interface {
-		Recv() (openai.ChatCompletionStreamResponse, error)
-		Close() error
+	c.Header("X-Provider", finalProviderName)
+	if streamResult.FailoverOccurred {
+		c.Header("X-Failover", "true")
+		c.Header("X-Original-Provider", streamResult.OriginalProvider)
 	}
 
-	var stream StreamReader
-	var streamErr error
-
-	switch providerName {
-	case "openai":
-		stream, streamErr = h.openaiProvider.ChatCompletionStream(ctx, req)
-	case "anthropic":
-		stream, streamErr = h.anthropicProvider.ChatCompletionStream(ctx, req)
-	case "google":
-		stream, streamErr = h.geminiProvider.ChatCompletionStream(ctx, req)
-	case "ollama":
-		if h.ollamaProvider == nil {
-			streaming.SendSSEError(c, fmt.Errorf("ollama not configured (set OLLAMA_BASE_URL)"))
-			return
-		}
-		stream, streamErr = h.ollamaProvider.ChatCompletionStream(ctx, req)
-	default:
-		streaming.SendSSEError(c, fmt.Errorf("streaming not supported for provider %s", providerName))
-		return
+	// Step 8: Stream chunks to client and collect for caching
+	collector := streaming.NewStreamCollector(finalProviderName, finalModel)
+	failoverCount := streamResult.AttemptsCount - 1
+	if failoverCount < 0 {
+		failoverCount = 0
 	}
-
-	if streamErr != nil {
-		streaming.SendSSEError(c, streamErr)
-		// Log error in background
-		go h.logRequest(context.Background(), apiKey, providerName, req, nil, false, false, 0, nil, "", customerID, customerLabels)
-		return
-	}
-	defer stream.Close()
-
-	// Step 7: Stream chunks to client and collect for caching
-	collector := streaming.NewStreamCollector(providerName, req.Model)
-	requestID := uuid.New().String()
 
 	// Estimate prompt tokens for cost calculation
 	// We'll update with actual count if provided in the stream
@@ -281,8 +340,29 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 	// Active only for Ollama when the user hasn't opted into raw chunks.
 	// nil = forward every chunk unchanged.
 	var ollamaFilter *streaming.OllamaStreamFilter
-	if providerName == "ollama" && h.cfg.OllamaFilterEmptyChunks {
+	if finalProviderName == "ollama" && h.cfg.OllamaFilterEmptyChunks {
 		ollamaFilter = streaming.NewOllamaStreamFilter()
+	}
+
+	// The first chunk was already consumed during pre-first-byte priming
+	// (step 6) — forward (if not filtered) + absorb it before pulling the
+	// rest from the stream.
+	firstChunk := streamResult.FirstChunk
+	if ollamaFilter.Forward(firstChunk) {
+		if err := streaming.SendSSEData(c, firstChunk); err != nil {
+			fmt.Printf("⚠️ Client disconnected: %v\n", err)
+			return
+		}
+	}
+	if len(firstChunk.Choices) > 0 {
+		delta := firstChunk.Choices[0].Delta
+		collector.AddChunk(delta.Content)
+		if firstChunk.Choices[0].FinishReason != "" {
+			collector.SetFinishReason(string(firstChunk.Choices[0].FinishReason))
+		}
+	}
+	if firstChunk.Usage != nil {
+		collector.AddUsage(*firstChunk.Usage)
 	}
 
 	for {
@@ -295,14 +375,14 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 			collector.EstimateTokensIfNeeded()
 			fullResponse := collector.ToResponse()
 
-		actualCost, err := h.costCalculator.CalculateCost(providerName, req.Model, fullResponse.Usage.PromptTokens, fullResponse.Usage.CompletionTokens)
-		if err != nil {
-			fmt.Printf("⚠️ Cost calculation failed: %v\n", err)
-			actualCost = estimatedCost
-		}
-		actualCost = math.Round(actualCost*1e6) / 1e6
+			actualCost, err := h.costCalculator.CalculateCost(finalProviderName, finalModel, fullResponse.Usage.PromptTokens, fullResponse.Usage.CompletionTokens)
+			if err != nil {
+				fmt.Printf("⚠️ Cost calculation failed: %v\n", err)
+				actualCost = estimatedCost
+			}
+			actualCost = math.Round(actualCost*1e6) / 1e6
 
-		// Send cost metadata before [DONE]
+			// Send cost metadata before [DONE]
 			costData := map[string]interface{}{
 				"object": "chat.completion.chunk.metadata",
 				"usage": map[string]interface{}{
@@ -312,7 +392,7 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 				},
 				"cost_usd":   actualCost,
 				"latency_ms": int(time.Since(startTime).Milliseconds()),
-				"provider":   providerName,
+				"provider":   finalProviderName,
 			}
 			if err := streaming.SendSSEData(c, costData); err == nil {
 				c.Writer.Flush()
@@ -323,11 +403,12 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 		}
 
 		if err != nil {
-			// Error during streaming
+			// Error during streaming — strictly mid-stream (after the first
+			// chunk already went out): no retry, no failover, matches every
+			// other gateway.
 			fmt.Printf("❌ Streaming error: %v\n", err)
 			streaming.SendSSEError(c, err)
-			// Log error in background
-			go h.logRequest(context.Background(), apiKey, providerName, req, nil, false, false, 0, nil, requestID, customerID, customerLabels)
+			go h.logRequest(context.Background(), apiKey, finalProviderName, req, nil, false, false, 0, streamResult.FailoverOccurred, failoverCount, requestID, customerID, customerLabels)
 			return
 		}
 
@@ -359,9 +440,8 @@ func (h *ChatHandler) ChatCompletionsStream(c *gin.Context) {
 		}
 	}
 
-	// Step 8: Post-stream processing
-
-	go h.postStreamProcessing(context.Background(), apiKey, providerName, req, collector, requestID, estimatedCost, spendKey, startTime, customerID, customerTier, customerLabels)
+	// Step 9: Post-stream processing
+	go h.postStreamProcessing(context.Background(), apiKey, finalProviderName, req, finalModel, collector, requestID, estimatedCost, spendKey, startTime, customerID, customerTier, customerLabels, streamResult.FailoverOccurred, failoverCount)
 
 	fmt.Printf("✅ Streaming request completed in %dms\n", int(time.Since(startTime).Milliseconds()))
 }
@@ -372,6 +452,7 @@ func (h *ChatHandler) postStreamProcessing(
 	apiKey *models.CachedAPIKey,
 	providerName string,
 	req providers.ChatRequest,
+	finalModel string,
 	collector *streaming.StreamCollector,
 	requestID string,
 	estimatedCost float64,
@@ -380,15 +461,18 @@ func (h *ChatHandler) postStreamProcessing(
 	customerID string,
 	customerTier string,
 	customerLabels models.Labels,
+	failoverOccurred bool,
+	failoverCount int,
 ) {
 	// Convert collected data to full response
 	fullResponse := collector.ToResponse()
 	fullResponse.ID = requestID
 
-	// Calculate actual cost
+	// Calculate actual cost — final provider/model, which may differ from
+	// req.Model after a pre-first-byte failover.
 	actualCost, err := h.costCalculator.CalculateCost(
 		providerName,
-		req.Model,
+		finalModel,
 		collector.PromptTokens,
 		collector.CompletionTokens,
 	)
@@ -411,12 +495,12 @@ func (h *ChatHandler) postStreamProcessing(
 
 	// Record per-customer spend + counters (if X-Customer-ID provided) so
 	// streaming requests count toward per-customer daily/monthly caps and
-	// rate limits. Streaming has no failover, so provider/model are final.
+	// rate limits.
 	if customerID != "" {
 		if err := h.customerLimiter.RecordRequest(ctx, &ratelimit.CheckRequest{
 			ProjectID:  apiKey.ProjectID,
 			CustomerID: customerID,
-			Model:      req.Model,
+			Model:      finalModel,
 			CostUSD:    actualCost,
 			Labels:     customerLabels,
 			Tier:       customerTier,
@@ -426,15 +510,18 @@ func (h *ChatHandler) postStreamProcessing(
 		}
 	}
 
-	// Cache the full response (if caching enabled)
+	// Cache the full response (if caching enabled) — keyed by the *final*
+	// provider/model, which can differ from the pre-call cache read key
+	// (step 3) after a pre-first-byte failover. Matches the non-streaming
+	// path's same-looking behavior.
 	if apiKey.CacheEnabled {
-		cacheKey, err := h.exactCache.CacheKey(apiKey.ProjectID, providerName, req.Model, req.Messages)
+		cacheKey, err := h.exactCache.CacheKey(apiKey.ProjectID, providerName, finalModel, req.Messages)
 		if err == nil {
 			cacheTTL := apiKey.CacheTTL
 			if cacheTTL == 0 {
 				cacheTTL = h.cfg.CacheTTLSeconds
 			}
-			if err := h.exactCache.Set(ctx, apiKey.ProjectID, cacheKey, providerName, req.Model, fullResponse, cacheTTL); err != nil {
+			if err := h.exactCache.Set(ctx, apiKey.ProjectID, cacheKey, providerName, finalModel, fullResponse, cacheTTL); err != nil {
 				fmt.Printf("⚠️ Failed to cache: %v\n", err)
 			} else {
 				fmt.Println("💾 Cached streaming response")
@@ -443,7 +530,7 @@ func (h *ChatHandler) postStreamProcessing(
 
 		// Semantic cache (if enabled)
 		if apiKey.SemanticCacheEnabled && h.semanticCache != nil {
-			if err := h.semanticCache.Set(ctx, apiKey.ProjectID, providerName, req.Model, req.Messages, fullResponse); err != nil {
+			if err := h.semanticCache.Set(ctx, apiKey.ProjectID, providerName, finalModel, req.Messages, fullResponse); err != nil {
 				fmt.Printf("⚠️ Failed to cache semantically: %v\n", err)
 			} else {
 				fmt.Println("💾 Cached streaming response (semantic)")
@@ -452,7 +539,7 @@ func (h *ChatHandler) postStreamProcessing(
 	}
 
 	// Log request
-	h.logRequest(ctx, apiKey, providerName, req, fullResponse, false, false, 0, nil, requestID, customerID, customerLabels)
+	h.logRequest(ctx, apiKey, providerName, req, fullResponse, false, false, 0, failoverOccurred, failoverCount, requestID, customerID, customerLabels)
 
 	fmt.Printf("✅ Post-stream processing complete (cost=$%.6f)\n", actualCost)
 }

@@ -348,7 +348,7 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 				c.JSON(200, cachedResponse)
 
 				// Log cache hit in background
-				go h.logRequest(context.Background(), apiKey, providerName, req, cachedResponse, true, false, 0, nil, "", customerID, customerLabels)
+				go h.logRequest(context.Background(), apiKey, providerName, req, cachedResponse, true, false, 0, false, 0, "", customerID, customerLabels)
 				return
 			}
 		}
@@ -372,7 +372,7 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 				c.JSON(200, cachedResponse)
 
 				// Log cache hit in background
-				go h.logRequest(context.Background(), apiKey, providerName, req, cachedResponse, false, true, similarityScore, nil, "", customerID, customerLabels)
+				go h.logRequest(context.Background(), apiKey, providerName, req, cachedResponse, false, true, similarityScore, false, 0, "", customerID, customerLabels)
 				return
 			}
 		}
@@ -418,8 +418,9 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 			"error":   "provider_error",
 			"message": failoverResult.Error.Error(),
 		})
-		// Log error in background
-		go h.logRequest(context.Background(), apiKey, providerName, req, nil, false, false, 0, failoverResult, requestID, customerID, customerLabels)
+		// Log error in background — attribute to the last provider actually
+		// attempted, not the originally detected one.
+		go h.logRequest(context.Background(), apiKey, failoverResult.FinalProvider, req, nil, false, false, 0, failoverResult.FailoverOccurred, failoverResult.AttemptsCount-1, requestID, customerID, customerLabels)
 		return
 	}
 
@@ -434,7 +435,7 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 			failoverResult.FinalProvider, failoverResult.FinalModel)
 
 		// Log failover to database (background)
-		go h.failoverLogger.LogFailover(context.Background(), apiKey.ProjectID, requestID, failoverResult)
+		go h.failoverLogger.LogFailover(context.Background(), apiKey.ProjectID, requestID, failoverResult.FailoverOccurred, failoverResult.Attempts)
 	}
 
 	// Step 5: Calculate actual cost (use final provider/model after failover)
@@ -485,7 +486,7 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 	}
 
 	// Step 8: Log request in background
-	go h.logRequest(context.Background(), apiKey, finalProvider, req, response, false, false, 0, failoverResult, requestID, customerID, customerLabels)
+	go h.logRequest(context.Background(), apiKey, finalProvider, req, response, false, false, 0, failoverResult.FailoverOccurred, failoverResult.AttemptsCount-1, requestID, customerID, customerLabels)
 
 	// Step 8.5: Record customer request (if customer_id provided).
 	// Dispatched asynchronously: this performs 3+N Redis round trips plus a
@@ -534,7 +535,13 @@ func (h *ChatHandler) ChatCompletions(c *gin.Context) {
 		totalLatency, finalProvider, actualCost)
 }
 
-// logRequest logs the request to the database
+// logRequest logs the request to the database.
+//
+// `provider` should already be the final/last-attempted provider (the
+// caller resolves that from its FailoverResult / StreamFailoverResult) —
+// this function no longer takes the failover result itself so it works
+// unchanged for both the non-streaming and streaming handlers, which don't
+// share a result type.
 func (h *ChatHandler) logRequest(
 	ctx context.Context,
 	apiKey *models.CachedAPIKey,
@@ -544,7 +551,8 @@ func (h *ChatHandler) logRequest(
 	exactCacheHit bool,
 	semanticCacheHit bool,
 	similarityScore float32,
-	failoverResult *failover.FailoverResult,
+	failoverOccurred bool,
+	failoverCount int,
 	requestID string,
 	customerID string,
 	customerLabels models.Labels,
@@ -564,15 +572,9 @@ func (h *ChatHandler) logRequest(
 		}
 	}
 
-	// Failover metadata
-	failoverOccurred := false
 	finalProvider := provider
-	failoverCount := 0
-
-	if failoverResult != nil {
-		failoverOccurred = failoverResult.FailoverOccurred
-		finalProvider = failoverResult.FinalProvider
-		failoverCount = failoverResult.AttemptsCount - 1 // Number of failover attempts
+	if failoverCount < 0 {
+		failoverCount = 0
 	}
 
 	// Insert log (column names match schema)
@@ -587,12 +589,15 @@ func (h *ChatHandler) logRequest(
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, NOW())
 	`
 
+	// Every call site passes a non-nil resp on success and nil on failure
+	// (there's no successful request with no response body), so resp's
+	// presence alone determines status now that failoverResult isn't threaded
+	// through here anymore.
 	latencyMs := 0
 	status := "success"
 	if resp != nil {
 		latencyMs = resp.LatencyMs
-	}
-	if failoverResult != nil && !failoverResult.Success {
+	} else {
 		status = "error"
 	}
 
