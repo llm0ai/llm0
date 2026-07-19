@@ -68,7 +68,7 @@ func (e *Executor) Execute(
 	// If chain is empty or doesn't match the model, create a single-step chain
 	if len(steps) == 0 {
 		// Detect provider from model
-		providerName := e.detectProviderForModel(req.Model)
+		providerName := detectProviderForModel(req.Model)
 		if providerName == "" {
 			result.Error = fmt.Errorf("no provider found for model: %s", req.Model)
 			return result
@@ -283,7 +283,7 @@ func (e *Executor) ExecuteStream(
 	}
 
 	if len(steps) == 0 {
-		providerName := e.detectProviderForModel(req.Model)
+		providerName := detectProviderForModel(req.Model)
 		if providerName == "" {
 			result.Error = fmt.Errorf("no provider found for model: %s", req.Model)
 			return result
@@ -495,8 +495,10 @@ func (e *Executor) isRetriableError(attempt FailoverAttempt) bool {
 	}
 }
 
-// detectProviderForModel detects which provider a model belongs to
-func (e *Executor) detectProviderForModel(model string) string {
+// detectProviderForModel detects which provider a model belongs to, from
+// the model name alone. Package-level (not a method) so both the executor
+// and chains.go's config-driven chain builder can share it.
+func detectProviderForModel(model string) string {
 	modelLower := strings.ToLower(model)
 
 	// OpenAI models

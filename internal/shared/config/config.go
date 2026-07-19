@@ -6,6 +6,23 @@ import (
 	"time"
 )
 
+// Config-driven cross-provider failover defaults (see failover/chains.go).
+// These replace a hand-maintained per-model chain map: every model is
+// classified as "flagship" or "cheap", and failing over to another
+// provider means "that provider's configured model for the same class."
+// Bump these when a new generation ships; that's the only maintenance
+// this design requires. Env vars (FAILOVER_<PROVIDER>_<CLASS>) override
+// per-deployment without a rebuild.
+const (
+	DefaultFailoverOpenAIFlagship    = "gpt-5.4"
+	DefaultFailoverOpenAICheap       = "gpt-5.4-mini"
+	DefaultFailoverAnthropicFlagship = "claude-opus-4-7"
+	DefaultFailoverAnthropicCheap    = "claude-haiku-4-5-20251001"
+	DefaultFailoverGoogleFlagship    = "gemini-2.5-pro"
+	DefaultFailoverGoogleCheap       = "gemini-2.5-flash"
+	DefaultFailoverProviderOrder     = "openai,anthropic,google"
+)
+
 type Config struct {
 	// Server
 	Port        string
@@ -57,6 +74,22 @@ type Config struct {
 	OllamaModelFlagship string // e.g. llama3.3:70b
 	OllamaModelBalanced string // e.g. qwen2.5:14b
 	OllamaModelBudget   string // e.g. gemma3:4b
+
+	// Cross-provider failover defaults — "if this request fails over to
+	// provider X, which model on X should it use?", split by cost class so
+	// a cheap request doesn't fail over into an expensive model. See the
+	// Default* consts above and failover/chains.go for how these are used.
+	FailoverOpenAIFlagship    string
+	FailoverOpenAICheap       string
+	FailoverAnthropicFlagship string
+	FailoverAnthropicCheap    string
+	FailoverGoogleFlagship    string
+	FailoverGoogleCheap       string
+
+	// Comma-separated provider preference order for cross-provider failover,
+	// e.g. "openai,anthropic,google". The request's own origin provider is
+	// skipped automatically; the rest are tried in this order.
+	FailoverProviderOrder string
 
 	// Drop Ollama SSE chunks with empty content/tool_calls (role-only noise).
 	// Set OLLAMA_FILTER_EMPTY_CHUNKS=false for raw byte-for-byte streams.
@@ -126,11 +159,20 @@ func Load() *Config {
 		OllamaBaseURL: getEnv("OLLAMA_BASE_URL", ""),
 
 		// Failover routing
-		FailoverMode:        getEnv("FAILOVER_MODE", "cloud_first"),
-		OllamaModelFlagship: getEnv("OLLAMA_MODEL_FLAGSHIP", "llama3.3:70b"),
-		OllamaModelBalanced: getEnv("OLLAMA_MODEL_BALANCED", "qwen2.5:14b"),
-		OllamaModelBudget:   getEnv("OLLAMA_MODEL_BUDGET", "gemma3:4b"),
+		FailoverMode:            getEnv("FAILOVER_MODE", "cloud_first"),
+		OllamaModelFlagship:     getEnv("OLLAMA_MODEL_FLAGSHIP", "llama3.3:70b"),
+		OllamaModelBalanced:     getEnv("OLLAMA_MODEL_BALANCED", "qwen2.5:14b"),
+		OllamaModelBudget:       getEnv("OLLAMA_MODEL_BUDGET", "gemma3:4b"),
 		OllamaFilterEmptyChunks: getEnvAsBool("OLLAMA_FILTER_EMPTY_CHUNKS", true),
+
+		// Cross-provider failover defaults
+		FailoverOpenAIFlagship:    getEnv("FAILOVER_OPENAI_FLAGSHIP", DefaultFailoverOpenAIFlagship),
+		FailoverOpenAICheap:       getEnv("FAILOVER_OPENAI_CHEAP", DefaultFailoverOpenAICheap),
+		FailoverAnthropicFlagship: getEnv("FAILOVER_ANTHROPIC_FLAGSHIP", DefaultFailoverAnthropicFlagship),
+		FailoverAnthropicCheap:    getEnv("FAILOVER_ANTHROPIC_CHEAP", DefaultFailoverAnthropicCheap),
+		FailoverGoogleFlagship:    getEnv("FAILOVER_GOOGLE_FLAGSHIP", DefaultFailoverGoogleFlagship),
+		FailoverGoogleCheap:       getEnv("FAILOVER_GOOGLE_CHEAP", DefaultFailoverGoogleCheap),
+		FailoverProviderOrder:     getEnv("FAILOVER_PROVIDER_ORDER", DefaultFailoverProviderOrder),
 
 		// Cache
 		CacheTTLSeconds: getEnvAsInt("CACHE_TTL_SECONDS", 3600),  // 1 hour default

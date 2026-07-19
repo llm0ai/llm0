@@ -151,6 +151,98 @@ These are loose ideas — promote to **Planned** when confirmed:
 
 ---
 
+## [0.4.0] — 2026-07-19
+
+**Streaming failover + config-driven failover chains.** Failover now works
+for `"stream": true` requests too (up to the first byte), and the
+cross-provider fallback chains are no longer a hand-maintained per-model
+map — they're derived from six config values, so a new model release
+means bumping an env var instead of editing Go source.
+
+> **Note:** v0.3.0's changelog flagged the `customer_limits` table drop and
+> `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` removal for "v0.4.0." Neither shipped
+> in this release — both are deferred to a later one; nothing changes for
+> existing deployments on that front.
+
+### Added
+
+- **Pre-first-byte streaming failover** (`failover.Executor.ExecuteStream`,
+  `internal/gateway/failover/executor.go`). Each chain step's stream is
+  opened *and* its first chunk received before the gateway commits to it —
+  SSE headers aren't sent to the client until a provider has actually
+  started responding. A 429/5xx/timeout/connection error before the first
+  chunk transparently retries the next provider in the chain, invisibly to
+  the client. Once a byte has reached the client the stream is final —
+  matching the safety line every other gateway (LiteLLM, Portkey,
+  OpenRouter) draws, since a mid-stream retry would double-bill the caller
+  or splice two providers' output together. `chat_stream.go` rewritten
+  around this: SSE headers are committed to only after the winning
+  provider yields its first chunk.
+- **Config-driven cross-provider failover chains.** Every model is
+  classified `flagship` or `cheap` from its name (`mini`/`nano`/`haiku`/
+  `flash`/`lite`/`3.5` → cheap, else → flagship); failing over to another
+  provider now means "that provider's configured model for the same
+  class," resolved at request time in
+  `internal/gateway/failover/chains.go`. Replaces the ~15-entry
+  `DefaultFailoverChains` map and the separate `ModelTierMap`, both of
+  which had already drifted out of sync with `schema/seed_models.sql`
+  (`gpt-5.4`, `claude-opus-4-7` had pricing but no failover chain). Any
+  never-seen-before `gpt-*`/`claude-*`/`gemini-*` model name now resolves
+  a correct chain automatically.
+- **Six new env vars** to override the cross-provider defaults per
+  deployment without a rebuild: `FAILOVER_OPENAI_FLAGSHIP`,
+  `FAILOVER_OPENAI_CHEAP`, `FAILOVER_ANTHROPIC_FLAGSHIP`,
+  `FAILOVER_ANTHROPIC_CHEAP`, `FAILOVER_GOOGLE_FLAGSHIP`,
+  `FAILOVER_GOOGLE_CHEAP`, plus `FAILOVER_PROVIDER_ORDER` (default
+  `openai,anthropic,google`) to control which providers are tried, and in
+  what order, after the origin model's own provider.
+- **`failover.KnownCloudModels(cfg)`** — the new source for `GET
+  /v1/models`'s cloud model list (flagship + cheap per configured
+  provider, deduped). Deliberately not exhaustive; any
+  `gpt-*`/`claude-*`/`gemini-*` model still works for chat completions.
+
+### Changed
+
+- **`detectProviderForModel`** moved from an `Executor` method to a
+  package-level function in `internal/gateway/failover/`, shared by the
+  non-streaming executor, the streaming executor, and the new chain
+  builder.
+- **`failover.LogFailover`** decoupled from `FailoverResult` — takes
+  `failoverOccurred bool` and `[]FailoverAttempt` directly so streaming
+  and non-streaming paths share one logging function.
+
+### Tested
+
+- Verified live against real OpenAI/Anthropic/Google API calls via Docker
+  Compose: `GET /v1/models` reflects `.env` overrides exactly; a
+  deliberately-invalid cheap-class model name fails over to the
+  configured Anthropic *cheap* model; a deliberately-invalid flagship-
+  class model name fails over to the configured Anthropic *flagship*
+  model. Both confirmed end-to-end in `failover_logs`.
+- 8 new unit tests in `internal/gateway/failover/chains_test.go` covering
+  class-based derivation, `FAILOVER_PROVIDER_ORDER` overrides, per-field
+  env-style overrides, never-seen-before model names, and
+  `KnownCloudModels` dedup. All 13 pre-existing chain tests pass
+  unmodified.
+
+### Upgrade notes
+
+No schema changes, no breaking changes. Pure addition — every new
+`FAILOVER_*` env var has a code default, so existing deployments behave
+identically without touching `.env`.
+
+```bash
+git pull
+docker compose build gateway
+docker compose up -d gateway
+```
+
+Optional: copy the new `FAILOVER_*` block from `.env.example` into your
+`.env` if you want to pin specific fallback models instead of the code
+defaults.
+
+---
+
 ## [0.3.0] — 2026-06-XX
 
 **Spend-firewall expansion.** Per-customer enforcement now works without
@@ -272,15 +364,17 @@ between v0.2.0 and this release.
   - For "this one VIP gets a special cap" → assign that customer a
     unique tier slug (e.g. `vip-acme`) with its own caps.
   The `customer_limits` table itself stays in the schema for inspection
-  / read-only audits; it is scheduled for full removal in v0.4.0.
+  / read-only audits; it is scheduled for full removal in a future
+  release (deferred past v0.4.0 — see that release's notes).
 
 ### Deprecated
 
 - **`CUSTOMER_LIMIT_CACHE_TTL_SECONDS`** env var. Was the TTL of the
   in-process `customer_limits` cache, which is no longer consulted.
   Reading the value still works (zero behavioral effect) so existing
-  Compose / env files don't break. Will be removed in v0.4.0 alongside
-  the dead Go data-access layer (`internal/shared/database/customer_limits_cache.go`,
+  Compose / env files don't break. Will be removed in a future release
+  (deferred past v0.4.0) alongside the dead Go data-access layer
+  (`internal/shared/database/customer_limits_cache.go`,
   `GetCustomerLimit` / `UpsertCustomerLimit` / `DeleteCustomerLimit`).
   Tier and project-default caches are unaffected and have their own
   TTLs (~60 s in-process for tiers; `CACHE_TTL_SECONDS` for the

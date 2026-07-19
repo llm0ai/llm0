@@ -31,17 +31,20 @@ func (h *ChatHandler) ListModels(c *gin.Context) {
 	mode := h.cfg.FailoverMode
 
 	// ── Cloud models ──────────────────────────────────────────────────────────
+	// KnownCloudModels is the curated, config-driven default set (not
+	// exhaustive — any gpt-*/claude-*/gemini-* model works for chat
+	// completions; see failover/chains.go).
 	if mode != "local_only" {
-		for modelID, chain := range failover.DefaultFailoverChains {
+		for _, step := range failover.KnownCloudModels(h.cfg) {
 			// Only list models that are reachable given the configured API keys.
-			if !h.hasReachableProvider(chain) {
+			if !h.hasReachableProvider(failover.FailoverChain{Steps: []failover.FailoverStep{step}}) {
 				continue
 			}
 			models = append(models, modelObject{
-				ID:      modelID,
+				ID:      step.Model,
 				Object:  "model",
 				Created: 1700000000,
-				OwnedBy: cloudOwner(chain.Steps[0].Provider),
+				OwnedBy: cloudOwner(step.Provider),
 			})
 		}
 	}

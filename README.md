@@ -221,7 +221,7 @@ data: [DONE]
 **Streaming behavior notes:**
 - **Ollama empty-chunk filtering (default on).** Ollama's OpenAI adapter often sends many role-only SSE frames before content; the gateway drops those duplicates and keeps the first `role` chunk plus all content/`finish_reason` frames. Set `OLLAMA_FILTER_EMPTY_CHUNKS=false` to pass the raw stream through.
 - **Cache hits return a single JSON body, not a stream.** The response is already complete — there's nothing to stream — so you get the cached payload with `X-Cache-Hit: exact` or `semantic` set. Treat `Content-Type: application/json` in response to a stream request as "this was a cache hit." This matches OpenAI's own caching semantics.
-- **Failover is disabled for streaming requests.** Once a single chunk has been written to the client, we can't retry against a different provider without breaking the stream. Non-streaming requests keep full automatic failover. If provider reliability matters more than streaming UX, set `"stream": false`.
+- **Failover works for streaming too — up to the first byte.** The gateway opens each chain step's stream and waits for its first chunk *before* committing to it; the SSE headers aren't sent to the client until a provider has actually started responding. If a provider fails before its first chunk (429/5xx/timeout/connection error), the gateway transparently opens the next provider in the chain — the client never sees the failed attempt. Once a byte has reached the client, that stream is final: retrying mid-stream would either double-bill the caller or splice two providers' output together, so (like every other gateway — LiteLLM, Portkey, OpenRouter) failover stops there. See `internal/gateway/failover/executor.go`'s `ExecuteStream`.
 - **No client-side timeout issues.** The gateway disables the server's 60-second `WriteTimeout` on streaming requests only, so long reasoning outputs (o1, Claude extended thinking) and slow local Ollama generations aren't truncated.
 - **Post-stream caching runs in a background goroutine** after `[DONE]`, so the second identical request returns from cache with the full metadata and no LLM call.
 
@@ -809,6 +809,10 @@ All configuration is via environment variables. Copy `.env.example` to `.env`.
 | Variable | Default | Description |
 |---|---|---|
 | `FAILOVER_MODE` | `cloud_first` | One of `cloud_first`, `local_first`, `local_only`, `cloud_only`. See [Failover Modes](#configurable-failover-modes) above |
+| `FAILOVER_PROVIDER_ORDER` | `openai,anthropic,google` | Preference order for the *other* providers tried after the origin model's own provider (which is always skipped automatically) |
+| `FAILOVER_OPENAI_FLAGSHIP` / `FAILOVER_OPENAI_CHEAP` | `gpt-5.4` / `gpt-5.4-mini` | Model used on OpenAI when a **flagship-class** / **cheap-class** request from another provider fails over here |
+| `FAILOVER_ANTHROPIC_FLAGSHIP` / `FAILOVER_ANTHROPIC_CHEAP` | `claude-opus-4-7` / `claude-haiku-4-5-20251001` | Same, for Anthropic |
+| `FAILOVER_GOOGLE_FLAGSHIP` / `FAILOVER_GOOGLE_CHEAP` | `gemini-2.5-pro` / `gemini-2.5-flash` | Same, for Google |
 
 ### Server & Infrastructure
 
@@ -817,7 +821,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env`.
 | `PORT` | `8080` | Gateway listen port |
 | `ENVIRONMENT` | `local` | `local` or `production` (switches Gin to release mode) |
 | `CACHE_TTL_SECONDS` | `3600` | Dual-purpose: (1) default TTL for exact-match cache entries (overridable per project via `projects.cache_ttl_seconds`), and (2) TTL for the Redis `apikey:*` auth cache. Config changes to `monthly_cap_usd`, `rate_limit_per_minute`, or cache flags take up to this long to propagate unless you flush `apikey:*` manually. See `design/enforcement-and-caching.md` |
-| `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` | `60` | *(deprecated v0.3.0)* TTL for the legacy `customer_limits` in-process cache. The per-customer override path is no longer consulted; this knob is kept for compatibility and will be removed in v0.4.0. Tier and project-default caches have their own TTLs (~60 s in-process for tiers, `CACHE_TTL_SECONDS` for the API-key/project blob in Redis) |
+| `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` | `60` | *(deprecated v0.3.0)* TTL for the legacy `customer_limits` in-process cache. The per-customer override path is no longer consulted; this knob is kept for compatibility and will be removed in a future release. Tier and project-default caches have their own TTLs (~60 s in-process for tiers, `CACHE_TTL_SECONDS` for the API-key/project blob in Redis) |
 | `EMBEDDING_SERVICE_URL` | `""` | Enables semantic caching when set. Docker Compose sets this automatically |
 | `REQUEST_TIMEOUT` | `30s` | Upstream request timeout |
 | `MAX_CONCURRENT_REQUESTS` | `10000` | Concurrency ceiling for the HTTP server |
@@ -870,18 +874,25 @@ Incoming Request
 
 ### Failover Chains
 
-Failover chains are **dynamically composed at request time** based on `FAILOVER_MODE` and whether Ollama is configured. The base cloud chains are defined in `internal/gateway/failover/chains.go`.
+Failover chains are **derived at request time**, not hand-enumerated per model. This used to be a ~15-entry static map that silently went stale every time a new model shipped; now it's six config values (`FAILOVER_<PROVIDER>_FLAGSHIP`/`_CHEAP` above) plus a naming heuristic, in `internal/gateway/failover/chains.go`.
 
-**Base cloud chains** (used when no Ollama is configured, or in `cloud_only` mode):
+**How a chain is built** for a requested model:
 
-| Requested Model | Step 1 | Step 2 | Step 3 |
-|---|---|---|---|
-| `gpt-4o` | OpenAI | Anthropic claude-sonnet-4-6 | Google gemini-2.5-pro |
-| `gpt-4o-mini` | OpenAI | Anthropic claude-haiku-4-5 | Google gemini-2.5-flash |
-| `claude-sonnet-4-6` | Anthropic | OpenAI gpt-4o | Google gemini-2.5-pro |
-| `claude-haiku-4-5-20251001` | Anthropic | OpenAI gpt-4o-mini | Google gemini-2.5-flash |
-| `gemini-2.5-pro` | Google | OpenAI gpt-4o | Anthropic claude-sonnet-4-6 |
-| `gemini-2.5-flash` | Google | OpenAI gpt-4o-mini | Anthropic claude-haiku-4-5 |
+1. **Step 1** is always the requested model itself, on its own provider (detected from the `gpt-`/`claude-`/`gemini-` prefix — works for *any* model name, not just ones the gateway has seen before).
+2. The model is classified **flagship** or **cheap** from its name (`mini`/`nano`/`haiku`/`flash`/`lite`/`3.5` → cheap; everything else, including unrecognized names, → flagship — so an unknown/expensive-looking model fails toward quality, not toward the smallest available model).
+3. For each *other* provider, in `FAILOVER_PROVIDER_ORDER` (default `openai,anthropic,google`), append that provider's configured model for the **same class** — e.g. a cheap OpenAI request fails over to Anthropic's and Google's cheap models, never their flagship ones.
+
+Example with defaults (`FAILOVER_PROVIDER_ORDER=openai,anthropic,google`):
+
+| Requested Model | Class | Step 1 | Step 2 | Step 3 |
+|---|---|---|---|---|
+| `gpt-4o` | flagship | OpenAI gpt-4o | Anthropic claude-opus-4-7 | Google gemini-2.5-pro |
+| `gpt-4o-mini` | cheap | OpenAI gpt-4o-mini | Anthropic claude-haiku-4-5-20251001 | Google gemini-2.5-flash |
+| `claude-sonnet-4-6` | cheap* | Anthropic claude-sonnet-4-6 | OpenAI gpt-5.4-mini | Google gemini-2.5-flash |
+
+\* `sonnet` matches the "balanced" bucket of the naming heuristic, which collapses to the **cheap** class for cross-provider failover (see step 2 above) — only the "flagship" bucket (opus/pro/gpt-4o/unrecognized names) maps to the flagship class.
+
+New model released? Bump the relevant `FAILOVER_<PROVIDER>_*` env var (or the code default in `internal/shared/config/config.go`). No chain to hand-edit, and every never-seen-before model name still gets a correct chain.
 
 **Effect of `FAILOVER_MODE`** (example: request for `gpt-4o-mini` with `OLLAMA_MODEL_BALANCED=qwen2.5:14b`):
 
@@ -892,7 +903,7 @@ Failover chains are **dynamically composed at request time** based on `FAILOVER_
 | `local_first` | Ollama qwen2.5:14b → OpenAI → Anthropic haiku → Gemini flash |
 | `local_only` | Ollama qwen2.5:14b |
 
-**Tier resolution** — the gateway chooses which Ollama model to substitute based on the cloud model's quality tier: flagship (gpt-4o, claude-opus, gemini-pro), balanced (gpt-4o-mini, claude-sonnet, gemini-flash), or budget (gpt-3.5, claude-haiku, gemini-flash-lite).
+**Ollama tier resolution** — same name heuristic, three buckets instead of two: flagship (gpt-4o, claude-opus, gemini-pro class) → `OLLAMA_MODEL_FLAGSHIP`, balanced (gpt-4o-mini, claude-sonnet, gemini-flash class) → `OLLAMA_MODEL_BALANCED`, budget (gpt-3.5, claude-haiku, gemini-flash-lite class) → `OLLAMA_MODEL_BUDGET`.
 
 **Failover triggers**: `429` (rate limit), `5xx` (server error), connection timeout, connection error, `401`/`403` (auth failure — next provider may have a valid key), `404` (model not available on that provider).
 

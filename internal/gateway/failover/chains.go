@@ -6,176 +6,206 @@ import (
 	"github.com/llm0ai/llm0/internal/shared/config"
 )
 
-// Preset failover chains for Pro tier users
-// Based on best cost/performance ratios and reliability
+// Cross-provider failover, config-driven.
 //
-// Strategy:
-// - Primary: Best cost/performance for the model class
-// - First fallback: Different provider, similar capability
-// - Second fallback: Budget option, still good quality
+// Historically this file hand-enumerated one FailoverChain per known model
+// (~15 entries) plus a per-model tier map. That drifts the moment a new
+// model ships — it already had, silently: schema/seed_models.sql lists
+// gpt-5.4 and claude-opus-4-7, neither of which had a chain here.
 //
-// Models verified as of Feb 2026:
-// - OpenAI: gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-3.5-turbo
-// - Anthropic: claude-sonnet-4-6, claude-opus-4-6, claude-haiku-4-5-20251001,
-//              claude-sonnet-4-5-20250929, claude-opus-4-5-20251101, claude-3-haiku-20240307
-// - Google: gemini-2.5-flash, gemini-2.5-pro, gemini-2.0-flash
+// The fix: classify the *requested* model into a cost class ("flagship" or
+// "cheap") from its name, then ask each other provider "what's your model
+// for that class?" — a question answered by six config values
+// (FAILOVER_<PROVIDER>_FLAGSHIP / _CHEAP, see internal/shared/config) instead
+// of by a hand-maintained map. A new model release means bumping a config
+// value (or the code default), never adding a map entry.
+//
+// Per-project overrides (managed platform) layer on top of this same
+// resolver later — they'll set cfg-equivalent values per project instead of
+// per deployment, without changing this algorithm.
 
-// DefaultFailoverChains defines preset failover chains for different model classes
-var DefaultFailoverChains = map[string]FailoverChain{
-	// ── OpenAI flagship ──────────────────────────────────────────────────────────
-	"gpt-4o": {
-		Steps: []FailoverStep{
-			{Provider: "openai", Model: "gpt-4o", ProviderName: "OpenAI"},
-			{Provider: "anthropic", Model: "claude-sonnet-4-6", ProviderName: "Anthropic"},
-			{Provider: "google", Model: "gemini-2.5-pro", ProviderName: "Google"},
-		},
-	},
-	"gpt-4-turbo": {
-		Steps: []FailoverStep{
-			{Provider: "openai", Model: "gpt-4-turbo", ProviderName: "OpenAI"},
-			{Provider: "anthropic", Model: "claude-sonnet-4-6", ProviderName: "Anthropic"},
-			{Provider: "google", Model: "gemini-2.5-pro", ProviderName: "Google"},
-		},
-	},
-
-	// ── OpenAI cost-optimized ─────────────────────────────────────────────────
-	"gpt-4o-mini": {
-		Steps: []FailoverStep{
-			{Provider: "openai", Model: "gpt-4o-mini", ProviderName: "OpenAI"},
-			{Provider: "anthropic", Model: "claude-haiku-4-5-20251001", ProviderName: "Anthropic"},
-			{Provider: "google", Model: "gemini-2.5-flash", ProviderName: "Google"},
-		},
-	},
-	"gpt-3.5-turbo": {
-		Steps: []FailoverStep{
-			{Provider: "openai", Model: "gpt-3.5-turbo", ProviderName: "OpenAI"},
-			{Provider: "anthropic", Model: "claude-3-haiku-20240307", ProviderName: "Anthropic"},
-			{Provider: "google", Model: "gemini-2.0-flash", ProviderName: "Google"},
-		},
-	},
-
-	// ── Anthropic Claude 4.6 (latest) ────────────────────────────────────────
-	"claude-sonnet-4-6": {
-		Steps: []FailoverStep{
-			{Provider: "anthropic", Model: "claude-sonnet-4-6", ProviderName: "Anthropic"},
-			{Provider: "openai", Model: "gpt-4o", ProviderName: "OpenAI"},
-			{Provider: "google", Model: "gemini-2.5-pro", ProviderName: "Google"},
-		},
-	},
-	"claude-opus-4-6": {
-		Steps: []FailoverStep{
-			{Provider: "anthropic", Model: "claude-opus-4-6", ProviderName: "Anthropic"},
-			{Provider: "openai", Model: "gpt-4o", ProviderName: "OpenAI"},
-			{Provider: "google", Model: "gemini-2.5-pro", ProviderName: "Google"},
-		},
-	},
-
-	// ── Anthropic Claude 4.5 ─────────────────────────────────────────────────
-	"claude-opus-4-5-20251101": {
-		Steps: []FailoverStep{
-			{Provider: "anthropic", Model: "claude-opus-4-5-20251101", ProviderName: "Anthropic"},
-			{Provider: "openai", Model: "gpt-4o", ProviderName: "OpenAI"},
-			{Provider: "google", Model: "gemini-2.5-pro", ProviderName: "Google"},
-		},
-	},
-	"claude-sonnet-4-5-20250929": {
-		Steps: []FailoverStep{
-			{Provider: "anthropic", Model: "claude-sonnet-4-5-20250929", ProviderName: "Anthropic"},
-			{Provider: "openai", Model: "gpt-4o", ProviderName: "OpenAI"},
-			{Provider: "google", Model: "gemini-2.5-pro", ProviderName: "Google"},
-		},
-	},
-	"claude-haiku-4-5-20251001": {
-		Steps: []FailoverStep{
-			{Provider: "anthropic", Model: "claude-haiku-4-5-20251001", ProviderName: "Anthropic"},
-			{Provider: "openai", Model: "gpt-4o-mini", ProviderName: "OpenAI"},
-			{Provider: "google", Model: "gemini-2.5-flash", ProviderName: "Google"},
-		},
-	},
-
-	// ── Anthropic Claude 4 ───────────────────────────────────────────────────
-	"claude-sonnet-4-20250514": {
-		Steps: []FailoverStep{
-			{Provider: "anthropic", Model: "claude-sonnet-4-20250514", ProviderName: "Anthropic"},
-			{Provider: "openai", Model: "gpt-4o", ProviderName: "OpenAI"},
-			{Provider: "google", Model: "gemini-2.5-pro", ProviderName: "Google"},
-		},
-	},
-	"claude-opus-4-20250514": {
-		Steps: []FailoverStep{
-			{Provider: "anthropic", Model: "claude-opus-4-20250514", ProviderName: "Anthropic"},
-			{Provider: "openai", Model: "gpt-4o", ProviderName: "OpenAI"},
-			{Provider: "google", Model: "gemini-2.5-pro", ProviderName: "Google"},
-		},
-	},
-
-	// ── Anthropic Claude 3 ───────────────────────────────────────────────────
-	"claude-3-haiku-20240307": {
-		Steps: []FailoverStep{
-			{Provider: "anthropic", Model: "claude-3-haiku-20240307", ProviderName: "Anthropic"},
-			{Provider: "openai", Model: "gpt-4o-mini", ProviderName: "OpenAI"},
-			{Provider: "google", Model: "gemini-2.0-flash", ProviderName: "Google"},
-		},
-	},
-
-	// ── Google Gemini ─────────────────────────────────────────────────────────
-	"gemini-2.5-pro": {
-		Steps: []FailoverStep{
-			{Provider: "google", Model: "gemini-2.5-pro", ProviderName: "Google"},
-			{Provider: "openai", Model: "gpt-4o", ProviderName: "OpenAI"},
-			{Provider: "anthropic", Model: "claude-sonnet-4-6", ProviderName: "Anthropic"},
-		},
-	},
-	"gemini-2.5-flash": {
-		Steps: []FailoverStep{
-			{Provider: "google", Model: "gemini-2.5-flash", ProviderName: "Google"},
-			{Provider: "openai", Model: "gpt-4o-mini", ProviderName: "OpenAI"},
-			{Provider: "anthropic", Model: "claude-haiku-4-5-20251001", ProviderName: "Anthropic"},
-		},
-	},
-	"gemini-2.0-flash": {
-		Steps: []FailoverStep{
-			{Provider: "google", Model: "gemini-2.0-flash", ProviderName: "Google"},
-			{Provider: "openai", Model: "gpt-4o-mini", ProviderName: "OpenAI"},
-			{Provider: "anthropic", Model: "claude-3-haiku-20240307", ProviderName: "Anthropic"},
-		},
-	},
-	"gemini-2.0-flash-lite": {
-		Steps: []FailoverStep{
-			{Provider: "google", Model: "gemini-2.0-flash-lite", ProviderName: "Google"},
-			{Provider: "openai", Model: "gpt-3.5-turbo", ProviderName: "OpenAI"},
-			{Provider: "anthropic", Model: "claude-3-haiku-20240307", ProviderName: "Anthropic"},
-		},
-	},
+// classifyTier buckets a model name into a rough quality/cost tier from
+// naming conventions alone. This never needs updating for new models: model
+// families keep using "mini"/"haiku"/"flash"/etc. for their cheap tier.
+// Used for two things: (1) collapsed to flagship/cheap for cross-provider
+// failover target selection, and (2) as-is (three buckets) for sizing the
+// local Ollama model when Ollama is in the chain.
+func classifyTier(model string) string {
+	m := strings.ToLower(model)
+	switch {
+	case strings.Contains(m, "nano"), strings.Contains(m, "mini"),
+		strings.Contains(m, "haiku"), strings.Contains(m, "lite"),
+		strings.Contains(m, "3.5"):
+		return "budget"
+	case strings.Contains(m, "flash"), strings.Contains(m, "sonnet"):
+		return "balanced"
+	default:
+		// Includes "opus", "pro", "gpt-4o", "gpt-5.x", "turbo", and any
+		// model name we don't recognize — defaulting unknown models to
+		// flagship (rather than the cheapest local model) is the safer
+		// failure mode for quality.
+		return "flagship"
+	}
 }
 
-// ModelTierMap classifies each cloud model into a quality tier used to select
-// the appropriate Ollama model when Ollama is in the failover chain.
-//
-//   flagship — gpt-4o / claude-opus / gemini-pro class
-//   balanced — gpt-4o-mini / claude-sonnet / gemini-flash class
-//   budget   — gpt-3.5 / claude-haiku / gemini-flash-lite class
-var ModelTierMap = map[string]string{
-	// OpenAI
-	"gpt-4o":            "flagship",
-	"gpt-4-turbo":       "flagship",
-	"gpt-4o-mini":       "balanced",
-	"gpt-3.5-turbo":     "budget",
-	"gpt-3.5-turbo-16k": "budget",
-	// Anthropic
-	"claude-opus-4-6":           "flagship",
-	"claude-opus-4-5-20251101":  "flagship",
-	"claude-opus-4-20250514":    "flagship",
-	"claude-sonnet-4-6":         "balanced",
-	"claude-sonnet-4-5-20250929": "balanced",
-	"claude-sonnet-4-20250514":  "balanced",
-	"claude-haiku-4-5-20251001": "budget",
-	"claude-3-haiku-20240307":   "budget",
-	// Google
-	"gemini-2.5-pro":      "flagship",
-	"gemini-2.5-flash":    "balanced",
-	"gemini-2.0-flash":    "budget",
-	"gemini-2.0-flash-lite": "budget",
+// cloudClass collapses the three-bucket tier down to the two classes
+// FAILOVER_<PROVIDER>_* config exposes. "balanced" and "budget" both fail
+// over to the other providers' cheap model — the only thing that matters
+// for cross-provider failover is "don't jump a cheap request to a flagship
+// price tag," not fine-grained tier parity.
+func cloudClass(tier string) string {
+	if tier == "flagship" {
+		return "flagship"
+	}
+	return "cheap"
+}
+
+// providerDisplayName returns the human-readable name used in logs/UI.
+func providerDisplayName(provider string) string {
+	switch provider {
+	case "openai":
+		return "OpenAI"
+	case "anthropic":
+		return "Anthropic"
+	case "google":
+		return "Google"
+	case "ollama":
+		return "Ollama"
+	default:
+		return provider
+	}
+}
+
+// providerOrder parses FailoverProviderOrder ("openai,anthropic,google")
+// into a normalized slice, falling back to the code default when cfg is nil
+// or the field is unset (e.g. a Config built directly in tests).
+func providerOrder(cfg *config.Config) []string {
+	raw := config.DefaultFailoverProviderOrder
+	if cfg != nil && cfg.FailoverProviderOrder != "" {
+		raw = cfg.FailoverProviderOrder
+	}
+
+	parts := strings.Split(raw, ",")
+	order := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" {
+			order = append(order, p)
+		}
+	}
+	return order
+}
+
+// providerDefaultModel returns the configured model for the given provider
+// + cost class ("flagship" | "cheap"), falling back to the code default in
+// internal/shared/config when cfg is nil or the specific field is unset.
+// Returns "" for an unrecognized provider (e.g. "ollama", handled
+// separately by ollamaStepForModel).
+func providerDefaultModel(provider, class string, cfg *config.Config) string {
+	var flagship, cheap string
+	if cfg != nil {
+		switch provider {
+		case "openai":
+			flagship, cheap = cfg.FailoverOpenAIFlagship, cfg.FailoverOpenAICheap
+		case "anthropic":
+			flagship, cheap = cfg.FailoverAnthropicFlagship, cfg.FailoverAnthropicCheap
+		case "google":
+			flagship, cheap = cfg.FailoverGoogleFlagship, cfg.FailoverGoogleCheap
+		}
+	}
+
+	switch provider {
+	case "openai":
+		if flagship == "" {
+			flagship = config.DefaultFailoverOpenAIFlagship
+		}
+		if cheap == "" {
+			cheap = config.DefaultFailoverOpenAICheap
+		}
+	case "anthropic":
+		if flagship == "" {
+			flagship = config.DefaultFailoverAnthropicFlagship
+		}
+		if cheap == "" {
+			cheap = config.DefaultFailoverAnthropicCheap
+		}
+	case "google":
+		if flagship == "" {
+			flagship = config.DefaultFailoverGoogleFlagship
+		}
+		if cheap == "" {
+			cheap = config.DefaultFailoverGoogleCheap
+		}
+	default:
+		return ""
+	}
+
+	if class == "flagship" {
+		return flagship
+	}
+	return cheap
+}
+
+// buildCloudChain derives the cross-provider chain for a request: the
+// requested model itself, then each other configured provider's default
+// model for the same cost class, in providerOrder. Returns nil when the
+// model's origin provider can't be determined (unknown model name) — the
+// caller then falls back to Ollama-only or nil, same as before.
+func buildCloudChain(model string, cfg *config.Config) *FailoverChain {
+	originProvider := detectProviderForModel(model)
+	if originProvider == "" {
+		return nil
+	}
+
+	class := cloudClass(classifyTier(model))
+
+	steps := []FailoverStep{
+		{Provider: originProvider, Model: model, ProviderName: providerDisplayName(originProvider)},
+	}
+
+	for _, p := range providerOrder(cfg) {
+		if p == originProvider {
+			continue
+		}
+		fallbackModel := providerDefaultModel(p, class, cfg)
+		if fallbackModel == "" {
+			continue
+		}
+		steps = append(steps, FailoverStep{
+			Provider:     p,
+			Model:        fallbackModel,
+			ProviderName: providerDisplayName(p),
+		})
+	}
+
+	return &FailoverChain{Steps: steps}
+}
+
+// KnownCloudModels returns the curated set of cross-provider default models
+// (flagship + cheap per configured provider) — used by GET /v1/models to
+// advertise a model list without hand-maintaining one. This is deliberately
+// not exhaustive (any gpt-*/claude-*/gemini-* model works for chat
+// completions via buildCloudChain above); it's the small "known-good" set
+// this deployment's config points at.
+func KnownCloudModels(cfg *config.Config) []FailoverStep {
+	var out []FailoverStep
+	seen := make(map[string]bool)
+
+	for _, p := range providerOrder(cfg) {
+		for _, class := range [...]string{"flagship", "cheap"} {
+			model := providerDefaultModel(p, class, cfg)
+			if model == "" {
+				continue
+			}
+			key := p + ":" + model
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, FailoverStep{Provider: p, Model: model, ProviderName: providerDisplayName(p)})
+		}
+	}
+	return out
 }
 
 // ollamaStepForModel returns the Ollama failover step appropriate for the given
@@ -185,7 +215,7 @@ func ollamaStepForModel(model string, cfg *config.Config) *FailoverStep {
 		return nil
 	}
 
-	tier := ModelTierMap[model]
+	tier := classifyTier(model)
 	var localModel string
 	switch tier {
 	case "flagship":
@@ -227,20 +257,8 @@ func GetFailoverChain(model string, cfg *config.Config) *FailoverChain {
 		return &FailoverChain{Steps: []FailoverStep{*step}}
 	}
 
-	// Resolve the base cloud chain (exact match, then prefix match).
-	var cloudChain *FailoverChain
-	if chain, ok := DefaultFailoverChains[model]; ok {
-		c := chain // copy
-		cloudChain = &c
-	} else {
-		for baseModel, chain := range DefaultFailoverChains {
-			if strings.HasPrefix(model, baseModel) {
-				c := chain
-				cloudChain = &c
-				break
-			}
-		}
-	}
+	// Resolve the base cloud chain (derived from provider defaults, not a map).
+	cloudChain := buildCloudChain(model, cfg)
 
 	// cloud_only: return cloud chain as-is (or nil if unknown model).
 	if mode == "cloud_only" {
