@@ -774,6 +774,53 @@ Example output:
 
 ---
 
+## Admin REST API
+
+The bash scripts above wrap `psql` directly — great for a one-off local
+setup, awkward for anything that wants to manage projects/keys
+programmatically (a dashboard, a CI step, `llm0.ai`'s own control plane).
+The gateway also exposes a small REST API for exactly that:
+
+```bash
+curl http://localhost:8081/v1/admin/projects \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+| Route | What it does |
+|---|---|
+| `GET/POST /v1/admin/projects` | List / create projects |
+| `GET/PATCH /v1/admin/projects/:id` | Read / update a project (cap, cache settings, active flag) |
+| `GET/POST /v1/admin/projects/:id/api-keys` | List / mint API keys for a project |
+| `PATCH /v1/admin/projects/:id/api-keys/:key_id` | Update a key's rate limit or active flag |
+
+Run `./scripts/admin_smoke.sh` for a scripted walkthrough (create project →
+create key → list both).
+
+### It's a second port, not just a token
+
+`/v1/admin/*` runs on its **own `http.Server`**, on its own port
+(`ADMIN_LISTEN_ADDR`, default `:8081`) — a completely separate listener
+from the public `PORT` (`8080`) that serves `/v1/chat/completions`. This
+is the primary defense: in any real deployment, the admin port is bound
+to an internal-only network (a Docker-internal network, a cloud
+provider's private networking, etc.) and never exposed publicly — so an
+external attacker can't reach `/v1/admin/*` **at all**, regardless of
+whether they have the token.
+
+`ADMIN_TOKEN` (checked with a constant-time comparison) is the second
+layer, for the case where something on your internal network is
+compromised. Leave `ADMIN_TOKEN` unset and the admin listener doesn't
+start — most self-hosters manage the gateway via the `scripts/*.sh`
+helpers above and never need this at all.
+
+```bash
+# .env
+ADMIN_TOKEN=<a long random string>   # unset = admin API disabled
+ADMIN_LISTEN_ADDR=:8081                # override if 8081 is taken, or to bind a specific interface
+```
+
+---
+
 ## Configuration
 
 All configuration is via environment variables. Copy `.env.example` to `.env`.
@@ -818,7 +865,9 @@ All configuration is via environment variables. Copy `.env.example` to `.env`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `8080` | Gateway listen port |
+| `PORT` | `8080` | Gateway listen port (public data plane) |
+| `ADMIN_TOKEN` | `""` | Bearer token for the [Admin REST API](#admin-rest-api). Unset (default) disables the admin listener entirely |
+| `ADMIN_LISTEN_ADDR` | `:8081` | Listen address for the admin API — a separate `http.Server`/port from `PORT`. Keep this off the public internet in any real deployment |
 | `ENVIRONMENT` | `local` | `local` or `production` (switches Gin to release mode) |
 | `CACHE_TTL_SECONDS` | `3600` | Dual-purpose: (1) default TTL for exact-match cache entries (overridable per project via `projects.cache_ttl_seconds`), and (2) TTL for the Redis `apikey:*` auth cache. Config changes to `monthly_cap_usd`, `rate_limit_per_minute`, or cache flags take up to this long to propagate unless you flush `apikey:*` manually. See `design/enforcement-and-caching.md` |
 | `CUSTOMER_LIMIT_CACHE_TTL_SECONDS` | `60` | *(deprecated v0.3.0)* TTL for the legacy `customer_limits` in-process cache. The per-customer override path is no longer consulted; this knob is kept for compatibility and will be removed in a future release. Tier and project-default caches have their own TTLs (~60 s in-process for tiers, `CACHE_TTL_SECONDS` for the API-key/project blob in Redis) |
@@ -1111,7 +1160,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 Unknown tier slugs silently fall through to the project default (typo-resistant, no error).
 
-> **Legacy `customer_limits` table** — through v0.2.0 a per-customer override row could be inserted via `manage_limits.sh set-customer-limit`. That code path was removed in v0.3.0; the table is still in the schema for inspection but the request resolver no longer reads it. Migrate by either (a) raising the matching tier's cap, (b) adjusting the project default, or (c) assigning that VIP a unique tier slug. The Admin API (M1) will restore a first-class per-customer override path.
+> **Legacy `customer_limits` table** — through v0.2.0 a per-customer override row could be inserted via `manage_limits.sh set-customer-limit`. That code path was removed in v0.3.0; the table is still in the schema for inspection but the request resolver no longer reads it. Migrate by either (a) raising the matching tier's cap, (b) adjusting the project default, or (c) assigning that VIP a unique tier slug. The [Admin REST API](#admin-rest-api) covers projects and API keys today; a first-class per-customer override endpoint may return there later if there's demand.
 
 #### Response headers (any cap path)
 
@@ -1428,6 +1477,17 @@ The single Go binary is ~30MB RSS at idle, ~50–80MB under load. Concurrent req
 | `GET` | `/ready` | None | Readiness check (Postgres + Redis connectivity) |
 | `GET` | `/live` | None | Liveness check |
 
+The [admin API](#admin-rest-api) lives on a **separate port**
+(`ADMIN_LISTEN_ADDR`, default `:8081`), not on the list above:
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET`/`POST` | `/v1/admin/projects` | `ADMIN_TOKEN` | List / create projects |
+| `GET`/`PATCH` | `/v1/admin/projects/:id` | `ADMIN_TOKEN` | Read / update a project |
+| `GET`/`POST` | `/v1/admin/projects/:id/api-keys` | `ADMIN_TOKEN` | List / mint API keys |
+| `PATCH` | `/v1/admin/projects/:id/api-keys/:key_id` | `ADMIN_TOKEN` | Update a key's rate limit or active flag |
+| `GET` | `/health` | None | Admin listener liveness check |
+
 ---
 
 ## Project Structure
@@ -1437,6 +1497,7 @@ llm0-gateway/
 ├── cmd/gateway/main.go              # Entry point, router setup, worker initialization
 ├── internal/
 │   ├── gateway/
+│   │   ├── admin/                  # Admin REST API (control plane, own port + ADMIN_TOKEN)
 │   │   ├── auth/                   # API key validation (bcrypt + Redis cache)
 │   │   ├── cache/                  # Exact-match (Redis+Postgres) and semantic cache
 │   │   ├── cost/                   # Pre/post request cost calculation
@@ -1459,7 +1520,8 @@ llm0-gateway/
 │   └── Dockerfile                  # Bakes all-MiniLM-L6-v2 weights at build time
 ├── schema/schema.sql               # Canonical DB schema (single source of truth)
 ├── scripts/
-│   └── create_api_key.sh           # Project + API key creation helper
+│   ├── create_api_key.sh           # Project + API key creation helper
+│   └── admin_smoke.sh              # Admin REST API walkthrough (create → list)
 ├── docker-compose.yml              # Postgres, Redis, embedding service, gateway
 ├── Dockerfile
 └── .env.example

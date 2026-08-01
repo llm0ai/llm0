@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 
+	"github.com/llm0ai/llm0/internal/gateway/admin"
 	"github.com/llm0ai/llm0/internal/gateway/auth"
 	"github.com/llm0ai/llm0/internal/gateway/handlers"
 	"github.com/llm0ai/llm0/internal/gateway/workers"
@@ -131,6 +132,14 @@ func main() {
 		}
 	}()
 
+	// Admin control plane — a second http.Server on its own port, never the
+	// one above. This is what lets it be firewalled off from the internet
+	// (Fly 6PN, a Docker-internal network, …) independently of the public
+	// API. See plans/managed/07-deployment-and-ops.md §1a. Skipped entirely
+	// when ADMIN_TOKEN is unset, so self-hosters who don't need it never
+	// open the port.
+	adminServer := startAdminServer(db, cfg)
+
 	// Print banner
 	printBanner(cfg)
 
@@ -151,8 +160,41 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("⚠️  Server forced to shutdown: %v", err)
 	}
+	if adminServer != nil {
+		if err := adminServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("⚠️  Admin server forced to shutdown: %v", err)
+		}
+	}
 
 	log.Println("✅ Server exited gracefully")
+}
+
+// startAdminServer starts the admin control-plane listener in a background
+// goroutine and returns its *http.Server (nil if disabled). Returning the
+// server, rather than nothing, lets main() shut it down gracefully alongside
+// the public one.
+func startAdminServer(db *database.DB, cfg *config.Config) *http.Server {
+	if cfg.AdminToken == "" {
+		log.Printf("⚠️  ADMIN_TOKEN not set — admin API disabled (see .env.example)")
+		return nil
+	}
+
+	adminServer := &http.Server{
+		Addr:         cfg.AdminListenAddr,
+		Handler:      admin.NewRouter(db, cfg.AdminToken),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("🔐 Admin API starting on %s (bind this to an internal-only network in production)", cfg.AdminListenAddr)
+		if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("❌ Admin server failed to start: %v", err)
+		}
+	}()
+
+	return adminServer
 }
 
 // createOptimizedServer creates an HTTP server with TLS 1.3 and optimized timeouts
@@ -203,6 +245,11 @@ func printBanner(cfg *config.Config) {
 	fmt.Printf("🤖 Failover mode:  %s\n", cfg.FailoverMode)
 	if cfg.OllamaBaseURL != "" {
 		fmt.Printf("🦙 Ollama:         %s\n", cfg.OllamaBaseURL)
+	}
+	if cfg.AdminToken != "" {
+		fmt.Printf("🔐 Admin API:      http://localhost%s/v1/admin (internal-only in production)\n", cfg.AdminListenAddr)
+	} else {
+		fmt.Printf("🔐 Admin API:      disabled (set ADMIN_TOKEN to enable)\n")
 	}
 	fmt.Println("")
 	fmt.Println("Press Ctrl+C to stop...")

@@ -113,6 +113,33 @@ full methodology, query, and Linux-vs-macOS comparison.
 
 ## [Unreleased]
 
+### Added
+
+- **Admin REST API** (`internal/gateway/admin/`) for managing projects and
+  API keys over HTTP instead of `psql`: `GET/POST /v1/admin/projects`,
+  `GET/PATCH /v1/admin/projects/:id`, `GET/POST
+  /v1/admin/projects/:id/api-keys`, `PATCH
+  /v1/admin/projects/:id/api-keys/:key_id`. This is the M0 milestone of
+  the managed-platform roadmap (`plans/managed/06-milestones-and-roadmap.md`)
+  — it's what a future dashboard (or anyone scripting the gateway) talks
+  to instead of raw SQL. The existing `scripts/*.sh` helpers are
+  unaffected and remain the quickest path for a one-off local change.
+- **Plane separation: the admin API runs on its own port.** A second
+  `http.Server` (`ADMIN_LISTEN_ADDR`, default `:8081`) is started
+  alongside the existing public one (`PORT`, `8080`) in
+  `cmd/gateway/main.go` — `/v1/admin/*` does not exist on the public
+  port at all. This is the primary defense for an otherwise-sensitive
+  API living inside the public OSS repo: in production the admin port is
+  bound to an internal-only network (a cloud provider's private
+  networking, a Docker-internal network) and never exposed to the
+  internet, independent of whether `ADMIN_TOKEN` leaks. See
+  `plans/managed/07-deployment-and-ops.md` §1a for the full rationale.
+  Leaving `ADMIN_TOKEN` unset (the default) disables the admin listener
+  entirely, so self-hosters who don't need it never open the port.
+- **`scripts/admin_smoke.sh`** — curl-based walkthrough (create project →
+  create API key → list projects → list API keys) proving the admin API
+  end to end, the "done when" criterion for the M0 milestone.
+
 ### Planned
 
 - **Scheduler heartbeat table** to close the v0.1.1 paper cut where

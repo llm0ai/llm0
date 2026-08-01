@@ -28,6 +28,14 @@ type Config struct {
 	Port        string
 	Environment string
 
+	// Admin API (control plane) — separate listener from the public data
+	// plane above. Intended to run on an internal-only network (Fly 6PN,
+	// a Docker-internal network, etc.); see plans/managed/07 §1a. Empty
+	// AdminToken disables the admin listener entirely so self-hosters who
+	// don't need it never open the port.
+	AdminListenAddr string
+	AdminToken      string
+
 	// Database
 	DatabaseURL string
 
@@ -120,6 +128,12 @@ func Load() *Config {
 		// Server
 		Port:        getEnv("PORT", "8080"),
 		Environment: getEnv("ENVIRONMENT", "local"),
+
+		// Admin API — default port kept fixed so docs/tooling can assume
+		// it, but fully overridable per deployment (e.g. binding to a
+		// specific internal interface).
+		AdminListenAddr: getEnv("ADMIN_LISTEN_ADDR", ":8081"),
+		AdminToken:      getEnv("ADMIN_TOKEN", ""),
 
 		// Database
 		DatabaseURL: getEnv("DATABASE_URL", "postgres://llm0_user:llm0_password@localhost:5432/llm0_gateway?sslmode=disable"),

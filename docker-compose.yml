@@ -81,6 +81,11 @@ services:
     container_name: llm0_gateway
     ports:
       - "8080:8080"
+      # 8081 (admin API) is published here purely for local dev/testing
+      # convenience (e.g. scripts/admin_smoke.sh from the host). In a real
+      # deployment this port must NOT be publicly reachable — bind it to an
+      # internal-only network instead. See plans/managed/07-deployment-and-ops.md §1a.
+      - "8081:8081"
     env_file:
       - .env
     environment:
