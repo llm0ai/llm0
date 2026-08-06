@@ -136,9 +136,16 @@ full methodology, query, and Linux-vs-macOS comparison.
   `plans/managed/07-deployment-and-ops.md` §1a for the full rationale.
   Leaving `ADMIN_TOKEN` unset (the default) disables the admin listener
   entirely, so self-hosters who don't need it never open the port.
+- **Admin REST API: tiers.** `GET/POST /v1/admin/projects/:id/tiers` and
+  `DELETE /v1/admin/projects/:id/tiers/:slug`, wrapping the existing
+  `customer_tiers` repository (`internal/shared/database/customer_tiers.go`)
+  that already backed `scripts/manage_tiers.sh`. `POST` is a full
+  replace-or-create (an omitted cap field means "no limit"), matching the
+  script's semantics exactly.
 - **`scripts/admin_smoke.sh`** — curl-based walkthrough (create project →
-  create API key → list projects → list API keys) proving the admin API
-  end to end, the "done when" criterion for the M0 milestone.
+  create API key → list projects → list API keys → create tier → list
+  tiers → delete tier) proving the admin API end to end, the "done when"
+  criterion for the M0 milestone.
 
 ### Planned
 

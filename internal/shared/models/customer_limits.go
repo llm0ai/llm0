@@ -85,22 +85,22 @@ func (ll *LabelLimits) Scan(value interface{}) error {
 // the values. See plans/customer-limits-tiers.md for the resolution rule.
 type LimitSpec struct {
 	// Cost-based limits
-	DailySpendLimitUSD   *float64 `db:"daily_spend_limit_usd"`
-	MonthlySpendLimitUSD *float64 `db:"monthly_spend_limit_usd"`
-	PerRequestMaxUSD     *float64 `db:"per_request_max_usd"`
+	DailySpendLimitUSD   *float64 `db:"daily_spend_limit_usd" json:"daily_spend_limit_usd"`
+	MonthlySpendLimitUSD *float64 `db:"monthly_spend_limit_usd" json:"monthly_spend_limit_usd"`
+	PerRequestMaxUSD     *float64 `db:"per_request_max_usd" json:"per_request_max_usd"`
 
 	// Request-based limits
-	RequestsPerMinute *int `db:"requests_per_minute"`
-	RequestsPerHour   *int `db:"requests_per_hour"`
-	RequestsPerDay    *int `db:"requests_per_day"`
+	RequestsPerMinute *int `db:"requests_per_minute" json:"requests_per_minute"`
+	RequestsPerHour   *int `db:"requests_per_hour" json:"requests_per_hour"`
+	RequestsPerDay    *int `db:"requests_per_day" json:"requests_per_day"`
 
 	// Advanced limits (JSONB)
-	ModelLimits ModelLimits `db:"model_limits"`
-	LabelLimits LabelLimits `db:"label_limits"`
+	ModelLimits ModelLimits `db:"model_limits" json:"model_limits,omitempty"`
+	LabelLimits LabelLimits `db:"label_limits" json:"label_limits,omitempty"`
 
 	// Behavior on limit
-	OnLimitBehavior LimitBehavior `db:"on_limit_behavior"`
-	DowngradeModel  *string       `db:"downgrade_model"`
+	OnLimitBehavior LimitBehavior `db:"on_limit_behavior" json:"on_limit_behavior"`
+	DowngradeModel  *string       `db:"downgrade_model" json:"downgrade_model"`
 }
 
 // HasCostLimit returns true if any cost-based limit is configured
@@ -181,14 +181,14 @@ func (l *LimitSpec) IsEmpty() bool {
 // continues to work unchanged. Per-customer overrides are managed-cloud only
 // in OSS Slice A; project defaults + tiers handle every OSS use case.
 type CustomerLimit struct {
-	ID         uuid.UUID `db:"id"`
-	ProjectID  uuid.UUID `db:"project_id"`
-	CustomerID string    `db:"customer_id"`
+	ID         uuid.UUID `db:"id" json:"id"`
+	ProjectID  uuid.UUID `db:"project_id" json:"project_id"`
+	CustomerID string    `db:"customer_id" json:"customer_id"`
 
 	LimitSpec
 
-	CreatedAt time.Time `db:"created_at"`
-	UpdatedAt time.Time `db:"updated_at"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
 }
 
 // CustomerTier is an owner-defined "plan" (e.g. 'free', 'pro', or any slug
@@ -196,14 +196,14 @@ type CustomerLimit struct {
 // request header. Names are NOT predefined by LLM0; the owner manages them
 // via scripts/manage_tiers.sh (OSS) or the managed dashboard.
 type CustomerTier struct {
-	ID        uuid.UUID `db:"id"`
-	ProjectID uuid.UUID `db:"project_id"`
-	Slug      string    `db:"slug"`
+	ID        uuid.UUID `db:"id" json:"id"`
+	ProjectID uuid.UUID `db:"project_id" json:"project_id"`
+	Slug      string    `db:"slug" json:"slug"`
 
 	LimitSpec
 
-	CreatedAt time.Time `db:"created_at"`
-	UpdatedAt time.Time `db:"updated_at"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time `db:"updated_at" json:"updated_at"`
 }
 
 // ============================================================================

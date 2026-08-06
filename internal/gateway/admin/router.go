@@ -1,5 +1,5 @@
 // Package admin implements the gateway's control plane: CRUD over
-// projects, API keys, and (soon) tiers/defaults/provider-keys. It exists
+// projects, API keys, and tiers (defaults still to come). It exists
 // alongside the public data plane (internal/gateway/handlers) but is never
 // mounted on the same listener — cmd/gateway/main.go runs it on its own
 // http.Server and port so it can be network-isolated independently of the
@@ -28,6 +28,7 @@ func NewRouter(db *database.DB, adminToken string) *gin.Engine {
 
 	projects := newProjectsHandler(db)
 	apiKeys := newAPIKeysHandler(db)
+	tiers := newTiersHandler(db)
 
 	v1 := router.Group("/v1/admin")
 	v1.Use(RequireAdminToken(adminToken))
@@ -40,6 +41,10 @@ func NewRouter(db *database.DB, adminToken string) *gin.Engine {
 		v1.GET("/projects/:id/api-keys", apiKeys.list)
 		v1.POST("/projects/:id/api-keys", apiKeys.create)
 		v1.PATCH("/projects/:id/api-keys/:key_id", apiKeys.update)
+
+		v1.GET("/projects/:id/tiers", tiers.list)
+		v1.POST("/projects/:id/tiers", tiers.upsert)
+		v1.DELETE("/projects/:id/tiers/:slug", tiers.delete)
 	}
 
 	return router

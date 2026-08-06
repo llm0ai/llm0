@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 # admin_smoke.sh — walks the admin REST API end to end:
-#   create project → create API key → list projects → list API keys
+#   create project → create API key → list projects → list API keys →
+#   create tier → list tiers → delete tier
 #
 # This is the canonical way to manage projects/keys going forward — the
 # bash + psql scripts (create_api_key.sh, manage_limits.sh, ...) still work
@@ -67,21 +68,21 @@ color_title "  $ADMIN_URL"
 divider
 echo ""
 
-echo "▶ 1/4  Create project"
+echo "▶ 1/7  Create project"
 out="$(admin_curl POST /v1/admin/projects '{"user_id":"'"$(uuidgen | tr '[:upper:]' '[:lower:]')"'","name":"admin_smoke test project","monthly_cap_usd":25}')"
 split_status "$out"; require_2xx "create project"
 PROJECT_ID="$(echo "$BODY" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)"
 color_success "  ✓ project $PROJECT_ID"
 echo ""
 
-echo "▶ 2/4  Create API key"
+echo "▶ 2/7  Create API key"
 out="$(admin_curl POST "/v1/admin/projects/$PROJECT_ID/api-keys" '{"name":"admin_smoke test key","rate_limit_per_minute":60}')"
 split_status "$out"; require_2xx "create API key"
 RAW_KEY="$(echo "$BODY" | grep -o '"api_key":"[^"]*"' | cut -d'"' -f4)"
 color_success "  ✓ key ${RAW_KEY:0:15}... (full value shown once above; not re-displayed)"
 echo ""
 
-echo "▶ 3/4  List projects (expect the one just created)"
+echo "▶ 3/7  List projects (expect the one just created)"
 out="$(admin_curl GET "/v1/admin/projects")"
 split_status "$out"; require_2xx "list projects"
 if [[ "$BODY" != *"$PROJECT_ID"* ]]; then
@@ -90,10 +91,31 @@ fi
 color_success "  ✓ found in project list"
 echo ""
 
-echo "▶ 4/4  List API keys for the project (expect the one just created)"
+echo "▶ 4/7  List API keys for the project (expect the one just created)"
 out="$(admin_curl GET "/v1/admin/projects/$PROJECT_ID/api-keys")"
 split_status "$out"; require_2xx "list API keys"
 color_success "  ✓ $(echo "$BODY" | grep -o '"id"' | wc -l | tr -d ' ') key(s) on the project"
+echo ""
+
+echo "▶ 5/7  Create tier 'pro' (\$5/day cap)"
+out="$(admin_curl POST "/v1/admin/projects/$PROJECT_ID/tiers" '{"slug":"pro","daily_spend_limit_usd":5,"requests_per_day":1000}')"
+split_status "$out"; require_2xx "create tier"
+color_success "  ✓ tier 'pro' created on project $PROJECT_ID"
+echo ""
+
+echo "▶ 6/7  List tiers for the project (expect 'pro')"
+out="$(admin_curl GET "/v1/admin/projects/$PROJECT_ID/tiers")"
+split_status "$out"; require_2xx "list tiers"
+if [[ "$BODY" != *'"slug":"pro"'* ]]; then
+  color_error "❌ created tier not found in list response"; exit 1
+fi
+color_success "  ✓ found in tier list"
+echo ""
+
+echo "▶ 7/7  Delete tier 'pro'"
+out="$(admin_curl DELETE "/v1/admin/projects/$PROJECT_ID/tiers/pro")"
+split_status "$out"; require_2xx "delete tier"
+color_success "  ✓ tier 'pro' deleted"
 echo ""
 
 divider
