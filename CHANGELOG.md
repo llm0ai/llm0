@@ -142,10 +142,23 @@ full methodology, query, and Linux-vs-macOS comparison.
   that already backed `scripts/manage_tiers.sh`. `POST` is a full
   replace-or-create (an omitted cap field means "no limit"), matching the
   script's semantics exactly.
+- **Admin REST API: project defaults.** `GET/PATCH/DELETE
+  /v1/admin/projects/:id/defaults` — the per-customer DEFAULT limits a
+  project applies to every customer without a more specific tier. Wraps
+  the existing `GetProjectDefaults`/`SetProjectDefaults`/
+  `ClearProjectDefaults` in `internal/shared/database/resolver.go` (already
+  backing `scripts/manage_project_defaults.sh` since Slice A) — no new DB
+  code needed. Unlike tiers, `PATCH` is a genuine partial update (an
+  omitted field is left unchanged); `DELETE` wipes every `default_*`
+  column back to `NULL`/`block`. This completes M0's OSS-gateway admin API
+  scope — `provider-keys` and `alert-channels` remain deferred to the
+  `llm0-cloud` control plane (M1), see
+  `plans/managed/06-milestones-and-roadmap.md`.
 - **`scripts/admin_smoke.sh`** — curl-based walkthrough (create project →
   create API key → list projects → list API keys → create tier → list
-  tiers → delete tier) proving the admin API end to end, the "done when"
-  criterion for the M0 milestone.
+  tiers → delete tier → set defaults → get defaults → clear defaults)
+  proving the admin API end to end, the "done when" criterion for the M0
+  milestone.
 
 ### Planned
 

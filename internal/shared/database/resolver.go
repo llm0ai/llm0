@@ -77,14 +77,14 @@ func (db *DB) ResolveCustomerLimit(
 // columns. All fields are optional pointers: a nil means "leave unchanged"
 // on SetProjectDefaults, and "no default configured" on Get.
 type ProjectDefaultLimits struct {
-	DailySpendLimitUSD   *float64
-	MonthlySpendLimitUSD *float64
-	PerRequestMaxUSD     *float64
-	RequestsPerMinute    *int
-	RequestsPerHour      *int
-	RequestsPerDay       *int
-	OnLimitBehavior      *string
-	DowngradeModel       *string
+	DailySpendLimitUSD   *float64 `json:"default_daily_spend_limit_usd"`
+	MonthlySpendLimitUSD *float64 `json:"default_monthly_spend_limit_usd"`
+	PerRequestMaxUSD     *float64 `json:"default_per_request_max_usd"`
+	RequestsPerMinute    *int     `json:"default_requests_per_minute"`
+	RequestsPerHour      *int     `json:"default_requests_per_hour"`
+	RequestsPerDay       *int     `json:"default_requests_per_day"`
+	OnLimitBehavior      *string  `json:"default_on_limit_behavior"`
+	DowngradeModel       *string  `json:"default_downgrade_model"`
 }
 
 // ToLimitSpec converts the stored defaults into a LimitSpec or returns nil if

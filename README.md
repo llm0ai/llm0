@@ -792,9 +792,13 @@ curl http://localhost:8081/v1/admin/projects \
 | `GET/PATCH /v1/admin/projects/:id` | Read / update a project (cap, cache settings, active flag) |
 | `GET/POST /v1/admin/projects/:id/api-keys` | List / mint API keys for a project |
 | `PATCH /v1/admin/projects/:id/api-keys/:key_id` | Update a key's rate limit or active flag |
+| `GET/POST /v1/admin/projects/:id/tiers` | List tiers / create-or-replace a tier by slug |
+| `DELETE /v1/admin/projects/:id/tiers/:slug` | Delete a tier |
+| `GET/PATCH /v1/admin/projects/:id/defaults` | Read / partially update the project's per-customer default limits |
+| `DELETE /v1/admin/projects/:id/defaults` | Clear all default limits back to unlimited |
 
-Run `./scripts/admin_smoke.sh` for a scripted walkthrough (create project →
-create key → list both).
+Run `./scripts/admin_smoke.sh` for a scripted walkthrough covering all of
+the above end to end.
 
 ### It's a second port, not just a token
 
@@ -1486,6 +1490,10 @@ The [admin API](#admin-rest-api) lives on a **separate port**
 | `GET`/`PATCH` | `/v1/admin/projects/:id` | `ADMIN_TOKEN` | Read / update a project |
 | `GET`/`POST` | `/v1/admin/projects/:id/api-keys` | `ADMIN_TOKEN` | List / mint API keys |
 | `PATCH` | `/v1/admin/projects/:id/api-keys/:key_id` | `ADMIN_TOKEN` | Update a key's rate limit or active flag |
+| `GET`/`POST` | `/v1/admin/projects/:id/tiers` | `ADMIN_TOKEN` | List tiers / create-or-replace a tier by slug |
+| `DELETE` | `/v1/admin/projects/:id/tiers/:slug` | `ADMIN_TOKEN` | Delete a tier |
+| `GET`/`PATCH` | `/v1/admin/projects/:id/defaults` | `ADMIN_TOKEN` | Read / partially update project default limits |
+| `DELETE` | `/v1/admin/projects/:id/defaults` | `ADMIN_TOKEN` | Clear all project default limits |
 | `GET` | `/health` | None | Admin listener liveness check |
 
 ---
@@ -1521,7 +1529,7 @@ llm0-gateway/
 ├── schema/schema.sql               # Canonical DB schema (single source of truth)
 ├── scripts/
 │   ├── create_api_key.sh           # Project + API key creation helper
-│   └── admin_smoke.sh              # Admin REST API walkthrough (create → list)
+│   └── admin_smoke.sh              # Admin REST API walkthrough (project/key/tier/defaults)
 ├── docker-compose.yml              # Postgres, Redis, embedding service, gateway
 ├── Dockerfile
 └── .env.example
