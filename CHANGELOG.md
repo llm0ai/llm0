@@ -113,6 +113,54 @@ full methodology, query, and Linux-vs-macOS comparison.
 
 ## [Unreleased]
 
+### Planned
+
+- **Scheduler heartbeat table** to close the v0.1.1 paper cut where
+  `SELECT count(*) FROM system_logs` returns zero on a fresh install
+  even though the scheduler is healthy. See
+  [`design/background-workers.md`](../design/background-workers.md#candidate-fix-for-v012)
+  for the proposed `scheduler_heartbeat` design.
+- **`manage_limits.sh` auto-invalidates the API-key auth cache** after
+  UPDATEs to `projects` (cap, rate limit, cache flags). Today an
+  operator has to manually `DEL apikey:*` for changes to propagate
+  faster than `CACHE_TTL_SECONDS` (default 1 hour). See
+  [`design/enforcement-and-caching.md`](../design/enforcement-and-caching.md)
+  → "Propagation delay on config changes".
+
+### Candidates (not committed)
+
+These are loose ideas — promote to **Planned** when confirmed:
+
+- Prometheus `/metrics` endpoint (counters for provider/model/status,
+  latency histograms, cache hit rate, failover count, cost total).
+- Add `xai-*` (Grok) provider — prefix-based routing is already in
+  place.
+- Add `deepseek-*` provider via their OpenAI-compatible endpoint.
+- `/v1/embeddings` proxy so users can use the bundled embedding service
+  through the same auth/rate-limit/spend-cap plumbing.
+- Publish pre-built Docker images to GHCR.
+- Document streaming integration recipes (LangChain, LlamaIndex, Vercel
+  AI SDK) in `docs/integrations/`.
+- Switch Redis `maxmemory-policy` from `allkeys-lru` to `noeviction` (or
+  a key-prefix-aware alternative) so `spend:*` counters can't be evicted
+  under memory pressure.
+- Sub-token-cost USD precision (`DECIMAL(16,8)`) — only relevant for
+  micro-billing scenarios where a single token of `gpt-4o-mini` input
+  (~$0.00000015) needs to be represented exactly. μUSD (6 decimals) is
+  enough for every cap and request cost LLM gateways realistically see.
+
+---
+
+## [0.5.0] — 2026-08-10
+
+**Admin REST API — the M0 milestone of the managed-platform roadmap.**
+Projects, API keys, tiers, and per-customer defaults can now be managed
+over HTTP instead of `psql` + bash scripts, on a network-isolated second
+port designed to be the integration point for a future dashboard/control
+plane (`plans/managed/06-milestones-and-roadmap.md`). The existing
+`scripts/*.sh` helpers are unaffected and remain the quickest path for a
+one-off local change.
+
 ### Added
 
 - **Admin REST API** (`internal/gateway/admin/`) for managing projects and
@@ -159,42 +207,6 @@ full methodology, query, and Linux-vs-macOS comparison.
   tiers → delete tier → set defaults → get defaults → clear defaults)
   proving the admin API end to end, the "done when" criterion for the M0
   milestone.
-
-### Planned
-
-- **Scheduler heartbeat table** to close the v0.1.1 paper cut where
-  `SELECT count(*) FROM system_logs` returns zero on a fresh install
-  even though the scheduler is healthy. See
-  [`design/background-workers.md`](../design/background-workers.md#candidate-fix-for-v012)
-  for the proposed `scheduler_heartbeat` design.
-- **`manage_limits.sh` auto-invalidates the API-key auth cache** after
-  UPDATEs to `projects` (cap, rate limit, cache flags). Today an
-  operator has to manually `DEL apikey:*` for changes to propagate
-  faster than `CACHE_TTL_SECONDS` (default 1 hour). See
-  [`design/enforcement-and-caching.md`](../design/enforcement-and-caching.md)
-  → "Propagation delay on config changes".
-
-### Candidates (not committed)
-
-These are loose ideas — promote to **Planned** when confirmed:
-
-- Prometheus `/metrics` endpoint (counters for provider/model/status,
-  latency histograms, cache hit rate, failover count, cost total).
-- Add `xai-*` (Grok) provider — prefix-based routing is already in
-  place.
-- Add `deepseek-*` provider via their OpenAI-compatible endpoint.
-- `/v1/embeddings` proxy so users can use the bundled embedding service
-  through the same auth/rate-limit/spend-cap plumbing.
-- Publish pre-built Docker images to GHCR.
-- Document streaming integration recipes (LangChain, LlamaIndex, Vercel
-  AI SDK) in `docs/integrations/`.
-- Switch Redis `maxmemory-policy` from `allkeys-lru` to `noeviction` (or
-  a key-prefix-aware alternative) so `spend:*` counters can't be evicted
-  under memory pressure.
-- Sub-token-cost USD precision (`DECIMAL(16,8)`) — only relevant for
-  micro-billing scenarios where a single token of `gpt-4o-mini` input
-  (~$0.00000015) needs to be represented exactly. μUSD (6 decimals) is
-  enough for every cap and request cost LLM gateways realistically see.
 
 ---
 
@@ -598,7 +610,10 @@ embedding image are unchanged.
 
 ---
 
-[Unreleased]: https://github.com/llm0ai/llm0/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/llm0ai/llm0/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/llm0ai/llm0/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/llm0ai/llm0/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/llm0ai/llm0/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/llm0ai/llm0/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/llm0ai/llm0/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/llm0ai/llm0/compare/v0.1.2...v0.1.3
